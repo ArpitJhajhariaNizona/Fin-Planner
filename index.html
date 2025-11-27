@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sovereign - Advanced Financial Planner v18</title>
+    <title>Sovereign - Advanced Financial Planner v19 (Advisor)</title>
     
     <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -36,6 +36,8 @@
         .status-badge { @apply px-2 py-1 rounded text-xs font-bold; }
         .proj-table-container { max-height: 500px; overflow-y: auto; }
         .proj-table th { position: sticky; top: 0; background: #f8fafc; z-index: 1; }
+        .animate-in { animation: fadeIn 0.5s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans">
@@ -80,6 +82,396 @@
             '#84cc16', '#ef4444', '#0ea5e9', '#eab308'
         ];
 
+        // --- CORE SIMULATION LOGIC (Extracted for Shadow Simulation) ---
+        const runSimulation = (data) => {
+            const { profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals } = data;
+
+            // Initialize Simulation Assets
+            let simAssets = assets.map(a => ({ 
+                ...a, 
+                currentBalance: parseFloat(a.currentValue) || 0,
+                sipAmount: parseFloat(a.sipAmount) || 0,
+                sipStartYear: parseInt(a.sipStartYear) || 0,
+                sipEndYear: parseInt(a.sipEndYear) || 0,
+                isEmergencyFund: a.type === 'Emergency Fund'
+            }));
+            
+            let simLiabilities = liabilities.map(l => ({ ...l, currentOutstanding: parseFloat(l.outstanding) || 0 }));
+            let dynamicLoans = []; 
+
+            const timeline = [];
+            const maxYear = Math.max(profile.lifeExpectancy - profile.currentAge, 40); 
+            const startYear = new Date().getFullYear();
+            let goalStatusLog = [];
+            let alerts = [];
+
+            for (let yearOffset = 0; yearOffset <= maxYear; yearOffset++) {
+                const currentYear = startYear + yearOffset;
+                
+                // 1. Calculate Annual Income and Expenses
+                let projectedAnnualIncome = 0;
+                incomes.forEach(inc => {
+                    if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
+                            projectedAnnualIncome += ((parseFloat(inc.monthlyAmount)||0) * 12 * Math.pow(1 + inc.growthRate/100, yearOffset));
+                    }
+                });
+
+                let projectedAnnualLivingExpenses = 0;
+                expenses.forEach(exp => {
+                        if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
+                        let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + (exp.inflation || profile.inflation) / 100, yearOffset);
+                        if (exp.frequency === 'Monthly') projectedAnnualLivingExpenses += (amt * 12);
+                        else projectedAnnualLivingExpenses += amt;
+                    }
+                });
+
+                // Approximate annual debt service
+                let approxAnnualDebt = 0;
+                [...simLiabilities, ...dynamicLoans].forEach(l => {
+                    let balance = l.currentOutstanding || l.outstanding;
+                    if(balance > 0) approxAnnualDebt += (l.emi * 12);
+                });
+
+                // Initial Surplus
+                let projectedAnnualSurplus = projectedAnnualIncome - projectedAnnualLivingExpenses - approxAnnualDebt;
+                let cashflowFundedGoalsCost = 0; 
+
+                const emergencyFundTarget = (projectedAnnualLivingExpenses / 12) * (profile.emergencyFundMonths || 6);
+
+                let yearlyIncome = 0;
+                let yearlyExpense = 0; 
+                let yearlyPrincipalPaid = 0;
+                let yearlySipInvested = 0;
+                
+                // --- GOAL PROCESSING ---
+                oneTimeGoals.forEach(goal => {
+                    if (goal.yearOffset === yearOffset) {
+                        const goalInflation = (goal.inflation !== undefined && goal.inflation !== "") ? goal.inflation : profile.inflation;
+                        const cost = (parseFloat(goal.cost) || 0) * Math.pow(1 + goalInflation / 100, yearOffset);
+                        
+                        const isRealEstate = /home|house|property|apartment|flat/i.test(goal.name);
+
+                        let amountNeededUpfront = cost;
+                        let loanAmount = 0;
+                        if (goal.fundingType === 'Loan') {
+                            const dpAmount = cost * (goal.downPaymentPercent / 100);
+                            amountNeededUpfront = dpAmount;
+                            loanAmount = cost - dpAmount;
+                        }
+
+                        let funded = false;
+                        let status = "Failed";
+                        let reason = "";
+                        
+                        let eligibleAssets = [];
+                        if (goal.fundingType === 'Savings-Only') {
+                            eligibleAssets = simAssets.filter(a => a.type === 'Liquid');
+                        } else if (goal.fundingType !== 'Income-Only') {
+                            eligibleAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate');
+                        }
+                        eligibleAssets.sort((a, b) => a.liquidationPriority - b.liquidationPriority);
+
+                        const totalEligibleAssetValue = eligibleAssets.reduce((sum, a) => sum + a.currentBalance, 0);
+                        const totalCapacity = projectedAnnualSurplus + (goal.fundingType === 'Income-Only' ? 0 : totalEligibleAssetValue);
+
+                        if (goal.type === 'Desire' && (totalCapacity < amountNeededUpfront || (totalCapacity + totalEligibleAssetValue - amountNeededUpfront - loanAmount < 0))) {
+                            status = "Skipped"; 
+                            reason = totalCapacity < amountNeededUpfront ? "Insufficient Total Funds" : "Negative NW Impact";
+                        } 
+                        else {
+                            let remainingToPay = amountNeededUpfront;
+                            let incomeContribution = 0;
+
+                            if (projectedAnnualSurplus > 0) {
+                                incomeContribution = Math.min(projectedAnnualSurplus, remainingToPay);
+                                projectedAnnualSurplus -= incomeContribution;
+                                cashflowFundedGoalsCost += incomeContribution;
+                                remainingToPay -= incomeContribution;
+                            }
+
+                            if (remainingToPay > 0 && goal.fundingType !== 'Income-Only') {
+                                for (let asset of eligibleAssets) {
+                                    if (remainingToPay <= 0) break;
+                                    let take = Math.min(asset.currentBalance, remainingToPay);
+                                    asset.currentBalance -= take;
+                                    remainingToPay -= take;
+                                }
+                            }
+
+                            if (remainingToPay <= 1) {
+                                funded = true;
+                                if (incomeContribution >= amountNeededUpfront) {
+                                    status = goal.fundingType === 'Loan' ? "Financed (Income DP)" : "Cashflow";
+                                } else if (incomeContribution > 0) {
+                                    status = goal.fundingType === 'Loan' ? "Financed (Hybrid DP)" : "Hybrid (Inc+Ast)";
+                                } else {
+                                    status = goal.fundingType === 'Loan' ? "Financed (Asset DP)" : "Asset Funded";
+                                }
+
+                                if (goal.fundingType === 'Loan' && loanAmount > 0) {
+                                    const newEMI = calculateEMI(loanAmount, goal.loanInterest, goal.loanTenure);
+                                    dynamicLoans.push({ 
+                                        id: `goal_loan_${goal.id}`, name: goal.name + " Loan", 
+                                        outstanding: loanAmount, rate: goal.loanInterest, emi: newEMI, 
+                                        tenure: goal.loanTenure, isRealEstateLoan: isRealEstate 
+                                    });
+                                }
+                            } else {
+                                status = goal.fundingType === 'Loan' ? "DP Shortfall" : "Shortfall";
+                                reason = "Assets Depleted";
+                            }
+                        }
+
+                        if (funded && isRealEstate) {
+                            simAssets.push({
+                                id: `prop_${goal.id}`,
+                                name: goal.name,
+                                type: 'Real Estate',
+                                currentBalance: cost,
+                                returnRate: goalInflation,
+                                investmentPriority: 99,
+                                liquidationPriority: 99,
+                                sipAmount: 0
+                            });
+                        }
+                        
+                        goalStatusLog.push({ id: goal.id, year: currentYear, goal: goal.name, status, cost, deficit: !funded ? cost : 0, reason });
+                    }
+                });
+
+                // --- MONTHLY CASHFLOW LOOP ---
+                for (let m = 0; m < 12; m++) {
+                    let monthlyCashIn = 0;
+                    let monthlyCashOut = 0; 
+                    let monthlyInterestPaid = 0;
+                    let monthlyPrincipalPaid = 0;
+                    
+                    // Income
+                    incomes.forEach(inc => {
+                        if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
+                            monthlyCashIn += (parseFloat(inc.monthlyAmount) || 0) * Math.pow(1 + inc.growthRate / 100, yearOffset);
+                        }
+                    });
+
+                    // Expenses
+                    expenses.forEach(exp => {
+                        if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
+                            let infl = (exp.inflation !== undefined && exp.inflation !== "") ? exp.inflation : profile.inflation;
+                            let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + infl / 100, yearOffset);
+                            if (exp.frequency === 'Annual') {
+                                if (m === 0) monthlyCashOut += amt; 
+                            } else {
+                                monthlyCashOut += amt;
+                            }
+                        }
+                    });
+
+                    if (m === 0 && cashflowFundedGoalsCost > 0) {
+                        monthlyCashOut += cashflowFundedGoalsCost;
+                    }
+
+                    tenuredGoals.forEach(tg => {
+                        if (yearOffset >= tg.startYearOffset && yearOffset < (tg.startYearOffset + tg.duration)) {
+                            const tgInflation = (tg.inflation !== undefined && tg.inflation !== "") ? tg.inflation : profile.inflation;
+                            const annualCost = (parseFloat(tg.annualCost) || 0) * Math.pow(1 + tgInflation / 100, yearOffset);
+                            if (m === 5) monthlyCashOut += annualCost;
+                        }
+                    });
+
+                    const processLoan = (loanObj, isDynamic = false) => {
+                        let balance = isDynamic ? loanObj.outstanding : loanObj.currentOutstanding;
+                        if (balance > 10) {
+                            let rate = isDynamic ? loanObj.rate : loanObj.interestRate;
+                            let emi = parseFloat(loanObj.emi) || 0;
+                            if (emi === 0 && balance > 0) emi = calculateEMI(balance, rate, 10);
+                            
+                            let interest = balance * (rate / 100) / 12;
+                            if (balance + interest < emi) emi = balance + interest;
+                            
+                            let principal = emi - interest;
+                            if (principal < 0) principal = 0; 
+
+                            if (isDynamic) loanObj.outstanding -= principal;
+                            else loanObj.currentOutstanding -= principal;
+
+                            monthlyInterestPaid += interest;
+                            monthlyPrincipalPaid += principal;
+                            monthlyCashOut += emi;
+                        }
+                    };
+
+                    simLiabilities.forEach(l => processLoan(l, false));
+                    dynamicLoans.forEach(l => processLoan(l, true));
+
+                    yearlyIncome += monthlyCashIn;
+                    yearlyExpense += (monthlyCashOut - monthlyPrincipalPaid); 
+                    yearlyPrincipalPaid += monthlyPrincipalPaid;
+                    
+                    let monthlySurplus = monthlyCashIn - monthlyCashOut;
+
+                    // --- SOLVENCY ---
+                    if (monthlySurplus < 0) {
+                        let deficit = Math.abs(monthlySurplus);
+                        const liquidatableAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate')
+                                                            .sort((a, b) => a.liquidationPriority - b.liquidationPriority);
+                            
+                        for (let asset of liquidatableAssets) {
+                            if (deficit <= 1) break; 
+                            if (asset.currentBalance > 0) {
+                                let withdraw = Math.min(asset.currentBalance, deficit);
+                                asset.currentBalance -= withdraw;
+                                deficit -= withdraw;
+                            }
+                        }
+
+                        if (deficit > 1) {
+                            const efAssets = simAssets.filter(a => a.isEmergencyFund);
+                            for (let asset of efAssets) {
+                                if (deficit <= 1) break;
+                                if (asset.currentBalance > 0) {
+                                    let withdraw = Math.min(asset.currentBalance, deficit);
+                                    asset.currentBalance -= withdraw;
+                                    deficit -= withdraw;
+                                }
+                            }
+                        }
+
+                        if (deficit > 100) {
+                            if (!alerts.find(a => a.year === currentYear && a.type === 'Expense')) {
+                                alerts.push({ year: currentYear, type: 'Expense', message: `Cashflow Crisis: Unfunded monthly expenses of ${formatCurrencyDisplay(deficit)}.` });
+                            }
+                            monthlySurplus = 0;
+                        }
+                    } else {
+                        // --- SURPLUS ALLOCATION ---
+                        const currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((sum, a) => sum + a.currentBalance, 0);
+                        let investableSurplus = monthlySurplus;
+
+                        if (currentEFValue < emergencyFundTarget) {
+                            const efGap = emergencyFundTarget - currentEFValue;
+                            const toEF = Math.min(investableSurplus, efGap);
+                            const efAssets = simAssets.filter(a => a.isEmergencyFund);
+                            if (efAssets.length > 0) {
+                                efAssets[0].currentBalance += toEF;
+                                investableSurplus -= toEF;
+                            }
+                        }
+
+                        if (investableSurplus > 0) {
+                            const activeSIPs = simAssets.filter(a => 
+                                !a.isEmergencyFund && a.type !== 'Real Estate' && 
+                                ((a.sipAmount > 0) || (profile.sipStrategy === 'Proportional' && a.sipProportion > 0)) &&
+                                yearOffset >= a.sipStartYear && yearOffset <= a.sipEndYear
+                            );
+
+                            if (profile.sipStrategy === 'Proportional') {
+                                const totalWeight = activeSIPs.reduce((sum, a) => sum + (a.sipProportion || 0), 0);
+                                if (totalWeight > 0) {
+                                    activeSIPs.forEach(asset => {
+                                        const share = (asset.sipProportion / totalWeight) * investableSurplus;
+                                        asset.currentBalance += share;
+                                        yearlySipInvested += share;
+                                    });
+                                } else {
+                                        const savings = simAssets.find(a => a.type === 'Liquid');
+                                        if(savings) savings.currentBalance += investableSurplus;
+                                }
+                            } else {
+                                const sipDemandList = activeSIPs.map(asset => {
+                                    return { 
+                                        assetRef: asset, 
+                                        requiredAmount: asset.sipAmount * Math.pow(1 + (asset.sipGrowth||0)/100, yearOffset),
+                                        priority: asset.investmentPriority
+                                    };
+                                });
+                                
+                                const totalSIPDemand = sipDemandList.reduce((sum, item) => sum + item.requiredAmount, 0);
+
+                                if (totalSIPDemand > 0 && investableSurplus >= totalSIPDemand) {
+                                    let excess = investableSurplus - totalSIPDemand;
+                                    sipDemandList.forEach(item => {
+                                        item.assetRef.currentBalance += item.requiredAmount;
+                                        yearlySipInvested += item.requiredAmount;
+                                    });
+                                    const parkingAsset = simAssets.find(a => a.type === 'Liquid');
+                                    if (parkingAsset) parkingAsset.currentBalance += excess;
+
+                                } else {
+                                    let available = investableSurplus;
+                                    const sortedList = [...sipDemandList].sort((a, b) => a.priority - b.priority);
+                                    for (let item of sortedList) {
+                                        if (available <= 0) break;
+                                        let invest = Math.min(available, item.requiredAmount);
+                                        item.assetRef.currentBalance += invest;
+                                        yearlySipInvested += invest;
+                                        available -= invest;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- ASSET GROWTH ---
+                simAssets.forEach(a => {
+                    let growth = a.currentBalance * (a.returnRate / 100);
+                    a.currentBalance += growth;
+                });
+
+                let totalRealEstateValue = simAssets.filter(a => a.type === 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
+                let totalLiquidAssets = simAssets.filter(a => a.type !== 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
+                let currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((s,a)=>s+a.currentBalance,0);
+                
+                let totalLiabilities = simLiabilities.reduce((sum, l) => sum + l.currentOutstanding, 0);
+                let totalDynamicLoans = dynamicLoans.reduce((sum, l) => sum + l.outstanding, 0);
+                
+                let totalDebt = totalLiabilities + totalDynamicLoans;
+
+                const assetBreakdown = simAssets.map(a => ({ name: a.name, value: a.currentBalance }));
+                const liabilityBreakdown = [...simLiabilities, ...dynamicLoans].map(l => ({ name: l.name, value: l.currentOutstanding || l.outstanding }));
+
+                timeline.push({
+                    year: currentYear,
+                    age: profile.currentAge + yearOffset,
+                    totalAssets: totalLiquidAssets + totalRealEstateValue,
+                    realEstateValue: totalRealEstateValue,
+                    liquidAssets: totalLiquidAssets,
+                    emergencyFund: currentEFValue,
+                    efTarget: emergencyFundTarget,
+                    totalLiabilities: totalDebt,
+                    netWorth: (totalLiquidAssets + totalRealEstateValue) - totalDebt,
+                    income: yearlyIncome,
+                    expense: yearlyExpense, 
+                    principalPaid: yearlyPrincipalPaid,
+                    invested: yearlySipInvested,
+                    assetBreakdown,
+                    liabilityBreakdown
+                });
+
+                if (currentEFValue < emergencyFundTarget * 0.5) {
+                        if (!alerts.find(a => a.year === currentYear && a.type.includes('Emergency'))) {
+                        alerts.push({ year: currentYear, type: 'Emergency Fund', message: `Emergency Fund critically low (${Math.round(currentEFValue/emergencyFundTarget*100)}%).` });
+                        }
+                }
+            }
+            
+            const tenuredGoalStatusLog = tenuredGoals.map(tg => {
+                const startYear = startYear + tg.startYearOffset;
+                const endYear = startYear + tg.duration;
+                
+                const crisisYears = alerts.filter(a => 
+                    a.type === 'Expense' && a.year >= startYear && a.year < endYear
+                );
+
+                let status = 'Funded';
+                if (crisisYears.length > 0) status = 'At Risk';
+                
+                return { goal: tg.name, status, years: `${startYear}-${endYear}`, crisisCount: crisisYears.length };
+            });
+
+            return { timeline, goalStatusLog, alerts, tenuredGoalStatusLog };
+        };
+
         // --- Initial Data Models ---
         const initialProfile = {
             name: "User",
@@ -90,7 +482,7 @@
             spouseName: "Wife",
             spouseAge: 32,
             emergencyFundMonths: 6,
-            sipStrategy: 'Growth' // 'Growth' (Fixed %) or 'Proportional' (% of Surplus)
+            sipStrategy: 'Growth' 
         };
 
         const initialIncomes = [
@@ -249,6 +641,48 @@
             );
         };
 
+        // --- RECOMMENDATION CARD COMPONENT ---
+        const RecommendationCard = ({ rec, onApply }) => {
+            return (
+                <div className="bg-white border-l-4 border-indigo-500 rounded-r-lg shadow-sm p-5 mb-4 animate-in">
+                    <div className="flex justify-between items-start">
+                        <div>
+                            <div className="flex items-center gap-2 mb-2">
+                                <span className="bg-indigo-100 text-indigo-800 text-xs px-2 py-1 rounded font-bold uppercase tracking-wide">Actionable</span>
+                                <h4 className="font-bold text-slate-800 text-lg">Unfunded Goal Solution</h4>
+                            </div>
+                            
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-4">
+                                <div>
+                                    <p className="text-xs text-slate-500 font-semibold uppercase">The Problem</p>
+                                    <p className="text-red-600 font-medium mt-1">"{rec.goalName}" fails at Year {rec.currentYear}</p>
+                                    <p className="text-sm text-slate-600">Goal amount: {formatCurrencyDisplay(rec.cost)}</p>
+                                </div>
+                                
+                                <div>
+                                    <p className="text-xs text-slate-500 font-semibold uppercase">The Prescription</p>
+                                    <p className="text-indigo-600 font-bold mt-1">Delay by {rec.delayYears} {rec.delayYears === 1 ? 'Year' : 'Years'}</p>
+                                    <p className="text-sm text-slate-600">Move from Year {rec.currentYear} to Year {rec.recommendedYear}</p>
+                                </div>
+
+                                <div>
+                                    <p className="text-xs text-slate-500 font-semibold uppercase">The Impact</p>
+                                    <p className="text-green-600 font-medium mt-1">{rec.impact}</p>
+                                </div>
+                            </div>
+                        </div>
+                        <button 
+                            onClick={() => onApply(rec)}
+                            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow flex items-center gap-2"
+                        >
+                            <i data-lucide="check-circle" className="w-4 h-4"></i>
+                            Apply Fix
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
         // --- Core Application ---
         const App = () => {
             const [activeTab, setActiveTab] = useState("dashboard");
@@ -260,12 +694,13 @@
             const [oneTimeGoals, setOneTimeGoals] = useState(initialOneTimeGoals);
             const [tenuredGoals, setTenuredGoals] = useState(initialTenuredGoals);
             const [simulationResults, setSimulationResults] = useState(null);
+            const [recommendations, setRecommendations] = useState([]);
             const [isExporting, setIsExporting] = useState(false);
 
             const planningHorizon = Math.max(0, profile.lifeExpectancy - profile.currentAge);
 
             useEffect(() => {
-                const savedData = localStorage.getItem('finPlannerData_v17');
+                const savedData = localStorage.getItem('finPlannerData_v19');
                 if (savedData) {
                     try {
                         const parsed = JSON.parse(savedData);
@@ -282,435 +717,78 @@
 
             useEffect(() => {
                 const data = { profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals };
-                localStorage.setItem('finPlannerData_v17', JSON.stringify(data));
+                localStorage.setItem('finPlannerData_v19', JSON.stringify(data));
             }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals]);
 
-            const calculateProjection = useCallback(() => {
-                // ... existing simulation logic (unchanged) ...
-                // Initialize Simulation Assets
-                let simAssets = assets.map(a => ({ 
-                    ...a, 
-                    currentBalance: parseFloat(a.currentValue) || 0,
-                    sipAmount: parseFloat(a.sipAmount) || 0,
-                    sipStartYear: parseInt(a.sipStartYear) || 0,
-                    sipEndYear: parseInt(a.sipEndYear) || 0,
-                    isEmergencyFund: a.type === 'Emergency Fund'
-                }));
-                
-                let simLiabilities = liabilities.map(l => ({ ...l, currentOutstanding: parseFloat(l.outstanding) || 0 }));
-                let dynamicLoans = []; 
+            // --- ADVISOR ENGINE ---
+            const generateRecommendations = useCallback((currentResults) => {
+                if (!currentResults) return;
+                const newRecs = [];
+                const failedGoals = currentResults.goalStatusLog.filter(g => ['Failed', 'Shortfall', 'DP Shortfall'].includes(g.status));
 
-                const timeline = [];
-                const maxYear = Math.max(profile.lifeExpectancy - profile.currentAge, 40); 
-                const startYear = new Date().getFullYear();
-                let goalStatusLog = [];
-                let alerts = [];
+                // 1. Goal Rescue Solver (Delay Strategy)
+                failedGoals.forEach(failed => {
+                    // Identify original goal object
+                    const originalGoal = oneTimeGoals.find(g => g.id === failed.id);
+                    if (!originalGoal) return;
 
-                for (let yearOffset = 0; yearOffset <= maxYear; yearOffset++) {
-                    const currentYear = startYear + yearOffset;
-                    
-                    // 1. Calculate Annual Income and Expenses for Surplus Check
-                    let projectedAnnualIncome = 0;
-                    incomes.forEach(inc => {
-                        if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
-                             projectedAnnualIncome += ((parseFloat(inc.monthlyAmount)||0) * 12 * Math.pow(1 + inc.growthRate/100, yearOffset));
-                        }
-                    });
+                    // Shadow Simulation Loop
+                    for (let delay = 1; delay <= 10; delay++) {
+                        const testOffset = originalGoal.yearOffset + delay;
+                        if (testOffset > planningHorizon) break;
 
-                    let projectedAnnualLivingExpenses = 0;
-                    expenses.forEach(exp => {
-                         if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
-                            let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + (exp.inflation || profile.inflation) / 100, yearOffset);
-                            if (exp.frequency === 'Monthly') projectedAnnualLivingExpenses += (amt * 12);
-                            else projectedAnnualLivingExpenses += amt;
-                        }
-                    });
+                        // Clone Data
+                        const shadowGoals = oneTimeGoals.map(g => 
+                            g.id === failed.id ? { ...g, yearOffset: testOffset } : g
+                        );
 
-                    // Approximate annual debt service (existing loans)
-                    let approxAnnualDebt = 0;
-                    [...simLiabilities, ...dynamicLoans].forEach(l => {
-                        let balance = l.currentOutstanding || l.outstanding;
-                        if(balance > 0) approxAnnualDebt += (l.emi * 12);
-                    });
-
-                    // Initial Surplus Available for Goals
-                    let projectedAnnualSurplus = projectedAnnualIncome - projectedAnnualLivingExpenses - approxAnnualDebt;
-                    let cashflowFundedGoalsCost = 0; // Track amount paid from income in Month 0
-
-                    const emergencyFundTarget = (projectedAnnualLivingExpenses / 12) * (profile.emergencyFundMonths || 6);
-
-                    let yearlyIncome = 0;
-                    let yearlyExpense = 0; // Pure expense (Spending + Interest)
-                    let yearlyPrincipalPaid = 0; // Wealth building
-                    let yearlySipInvested = 0;
-                    
-                    // --- STEP 1: GOAL PROCESSING (Start of Year) ---
-                    oneTimeGoals.forEach(goal => {
-                        if (goal.yearOffset === yearOffset) {
-                            const goalInflation = (goal.inflation !== undefined && goal.inflation !== "") ? goal.inflation : profile.inflation;
-                            const cost = (parseFloat(goal.cost) || 0) * Math.pow(1 + goalInflation / 100, yearOffset);
-                            
-                            const isRealEstate = /home|house|property|apartment|flat/i.test(goal.name);
-
-                            // Calculate Amount needed Upfront (Total Cost or Down Payment)
-                            let amountNeededUpfront = cost;
-                            let loanAmount = 0;
-                            if (goal.fundingType === 'Loan') {
-                                const dpAmount = cost * (goal.downPaymentPercent / 100);
-                                amountNeededUpfront = dpAmount;
-                                loanAmount = cost - dpAmount;
-                            }
-
-                            // --- HYBRID FUNDING LOGIC ---
-                            let funded = false;
-                            let status = "Failed";
-                            let reason = "";
-                            
-                            // 1. Identify Eligible Assets for Fallback
-                            let eligibleAssets = [];
-                            if (goal.fundingType === 'Savings-Only') {
-                                eligibleAssets = simAssets.filter(a => a.type === 'Liquid');
-                            } else if (goal.fundingType !== 'Income-Only') {
-                                eligibleAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate');
-                            }
-                            eligibleAssets.sort((a, b) => a.liquidationPriority - b.liquidationPriority); // Low priority first
-
-                            const totalEligibleAssetValue = eligibleAssets.reduce((sum, a) => sum + a.currentBalance, 0);
-                            const totalCapacity = projectedAnnualSurplus + (goal.fundingType === 'Income-Only' ? 0 : totalEligibleAssetValue);
-
-                            // 2. Feasibility Check
-                            // If Desire goal: Don't touch ANYTHING if total capacity < cost (preserve surplus & assets)
-                            if (goal.type === 'Desire' && (totalCapacity < amountNeededUpfront || (totalCapacity + totalEligibleAssetValue - amountNeededUpfront - loanAmount < 0))) {
-                                status = "Skipped"; 
-                                reason = totalCapacity < amountNeededUpfront ? "Insufficient Total Funds" : "Negative NW Impact";
-                            } 
-                            else {
-                                // It's feasible (or a Need that we must try to fund)
-                                let remainingToPay = amountNeededUpfront;
-                                let incomeContribution = 0;
-
-                                // A. Pay from Income Surplus First
-                                if (projectedAnnualSurplus > 0) {
-                                    incomeContribution = Math.min(projectedAnnualSurplus, remainingToPay);
-                                    projectedAnnualSurplus -= incomeContribution;
-                                    cashflowFundedGoalsCost += incomeContribution;
-                                    remainingToPay -= incomeContribution;
-                                }
-
-                                // B. Pay Balance from Assets
-                                if (remainingToPay > 0 && goal.fundingType !== 'Income-Only') {
-                                    for (let asset of eligibleAssets) {
-                                        if (remainingToPay <= 0) break;
-                                        let take = Math.min(asset.currentBalance, remainingToPay);
-                                        asset.currentBalance -= take;
-                                        remainingToPay -= take;
-                                    }
-                                }
-
-                                // C. Final Outcome
-                                if (remainingToPay <= 1) {
-                                    funded = true;
-                                    if (incomeContribution >= amountNeededUpfront) {
-                                        status = goal.fundingType === 'Loan' ? "Financed (Income DP)" : "Cashflow";
-                                    } else if (incomeContribution > 0) {
-                                        status = goal.fundingType === 'Loan' ? "Financed (Hybrid DP)" : "Hybrid (Inc+Ast)";
-                                    } else {
-                                        status = goal.fundingType === 'Loan' ? "Financed (Asset DP)" : "Asset Funded";
-                                    }
-
-                                    // Handle Loan Creation
-                                    if (goal.fundingType === 'Loan' && loanAmount > 0) {
-                                        const newEMI = calculateEMI(loanAmount, goal.loanInterest, goal.loanTenure);
-                                        dynamicLoans.push({ 
-                                            id: `goal_loan_${goal.id}`, name: goal.name + " Loan", 
-                                            outstanding: loanAmount, rate: goal.loanInterest, emi: newEMI, 
-                                            tenure: goal.loanTenure, isRealEstateLoan: isRealEstate 
-                                        });
-                                    }
-                                } else {
-                                    // Failed despite trying (Only happens for Needs or if Math was tight)
-                                    status = goal.fundingType === 'Loan' ? "DP Shortfall" : "Shortfall";
-                                    reason = "Assets Depleted";
-                                }
-                            }
-
-                            if (funded && isRealEstate) {
-                                // Add Property Asset
-                                simAssets.push({
-                                    id: `prop_${goal.id}`,
-                                    name: goal.name,
-                                    type: 'Real Estate',
-                                    currentBalance: cost,
-                                    returnRate: goalInflation, // Appreciate at goal's inflation rate
-                                    investmentPriority: 99,
-                                    liquidationPriority: 99,
-                                    sipAmount: 0
-                                });
-                            }
-                            
-                            goalStatusLog.push({ year: currentYear, goal: goal.name, status, cost, deficit: !funded ? cost : 0, reason });
-                        }
-                    });
-
-                    // --- STEP 2: MONTHLY CASHFLOW LOOP ---
-                    for (let m = 0; m < 12; m++) {
-                        let monthlyCashIn = 0;
-                        let monthlyCashOut = 0; 
-                        let monthlyInterestPaid = 0;
-                        let monthlyPrincipalPaid = 0;
-                        
-                        // Income
-                        incomes.forEach(inc => {
-                            if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
-                                monthlyCashIn += (parseFloat(inc.monthlyAmount) || 0) * Math.pow(1 + inc.growthRate / 100, yearOffset);
-                            }
+                        // Run Shadow Sim
+                        const shadowResult = runSimulation({
+                            profile, incomes, expenses, assets, liabilities, 
+                            oneTimeGoals: shadowGoals, tenuredGoals
                         });
 
-                        // Expenses
-                        expenses.forEach(exp => {
-                            if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
-                                let infl = (exp.inflation !== undefined && exp.inflation !== "") ? exp.inflation : profile.inflation;
-                                let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + infl / 100, yearOffset);
-                                if (exp.frequency === 'Annual') {
-                                    if (m === 0) monthlyCashOut += amt; 
-                                } else {
-                                    monthlyCashOut += amt;
-                                }
-                            }
-                        });
-
-                        // Pay Income-Funded Goal Costs in Month 0
-                        if (m === 0 && cashflowFundedGoalsCost > 0) {
-                            monthlyCashOut += cashflowFundedGoalsCost;
-                        }
-
-                        // Tenured Goals
-                        tenuredGoals.forEach(tg => {
-                            if (yearOffset >= tg.startYearOffset && yearOffset < (tg.startYearOffset + tg.duration)) {
-                                const tgInflation = (tg.inflation !== undefined && tg.inflation !== "") ? tg.inflation : profile.inflation;
-                                const annualCost = (parseFloat(tg.annualCost) || 0) * Math.pow(1 + tgInflation / 100, yearOffset);
-                                if (m === 5) monthlyCashOut += annualCost;
-                            }
-                        });
-
-                        // Liability Amortization
-                        const processLoan = (loanObj, isDynamic = false) => {
-                            let balance = isDynamic ? loanObj.outstanding : loanObj.currentOutstanding;
-                            if (balance > 10) {
-                                let rate = isDynamic ? loanObj.rate : loanObj.interestRate;
-                                let emi = parseFloat(loanObj.emi) || 0;
-                                
-                                // Recalc EMI if 0 (only for existing liabilities, dynamic ones have emi set)
-                                if (emi === 0 && balance > 0) emi = calculateEMI(balance, rate, 10);
-                                
-                                let interest = balance * (rate / 100) / 12;
-                                if (balance + interest < emi) emi = balance + interest;
-                                
-                                let principal = emi - interest;
-                                if (principal < 0) principal = 0; // Negative amortization guard
-
-                                if (isDynamic) loanObj.outstanding -= principal;
-                                else loanObj.currentOutstanding -= principal;
-
-                                monthlyInterestPaid += interest;
-                                monthlyPrincipalPaid += principal;
-                                monthlyCashOut += emi;
-                            }
-                        };
-
-                        simLiabilities.forEach(l => processLoan(l, false));
-                        dynamicLoans.forEach(l => processLoan(l, true));
-
-                        yearlyIncome += monthlyCashIn;
-                        yearlyExpense += (monthlyCashOut - monthlyPrincipalPaid); // Expense includes Interest, excludes Principal
-                        yearlyPrincipalPaid += monthlyPrincipalPaid;
-                        
-                        let monthlySurplus = monthlyCashIn - monthlyCashOut;
-
-                        // --- SOLVENCY & LIQUIDATION ---
-                        if (monthlySurplus < 0) {
-                            let deficit = Math.abs(monthlySurplus);
-                            // Don't liquidate EF or Real Estate first
-                            const liquidatableAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate')
-                                                              .sort((a, b) => a.liquidationPriority - b.liquidationPriority);
-                             
-                            for (let asset of liquidatableAssets) {
-                                if (deficit <= 1) break; 
-                                if (asset.currentBalance > 0) {
-                                    let withdraw = Math.min(asset.currentBalance, deficit);
-                                    asset.currentBalance -= withdraw;
-                                    deficit -= withdraw;
-                                }
-                            }
-
-                            // If still deficit, try Emergency Fund
-                            if (deficit > 1) {
-                                const efAssets = simAssets.filter(a => a.isEmergencyFund);
-                                for (let asset of efAssets) {
-                                    if (deficit <= 1) break;
-                                    if (asset.currentBalance > 0) {
-                                        let withdraw = Math.min(asset.currentBalance, deficit);
-                                        asset.currentBalance -= withdraw;
-                                        deficit -= withdraw;
-                                    }
-                                }
-                            }
-
-                            if (deficit > 100) {
-                                if (!alerts.find(a => a.year === currentYear && a.type === 'Expense')) {
-                                    alerts.push({ year: currentYear, type: 'Expense', message: `Cashflow Crisis: Unfunded monthly expenses of ${formatCurrencyDisplay(deficit)}.` });
-                                }
-                                monthlySurplus = 0;
-                            }
-                        } else {
-                            // --- SURPLUS ALLOCATION ---
-                            
-                            // 1. Emergency Fund Top-Up
-                            const currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((sum, a) => sum + a.currentBalance, 0);
-                            let investableSurplus = monthlySurplus;
-
-                            if (currentEFValue < emergencyFundTarget) {
-                                const efGap = emergencyFundTarget - currentEFValue;
-                                const toEF = Math.min(investableSurplus, efGap);
-                                
-                                // Distribute to EF assets
-                                const efAssets = simAssets.filter(a => a.isEmergencyFund);
-                                if (efAssets.length > 0) {
-                                    // Split equally or to first
-                                    efAssets[0].currentBalance += toEF;
-                                    investableSurplus -= toEF;
-                                    // Add to yearly invested? Technically yes, into savings
-                                }
-                            }
-
-                            // 2. SIP Allocation (with remaining surplus)
-                            if (investableSurplus > 0) {
-                                const activeSIPs = simAssets.filter(a => 
-                                    !a.isEmergencyFund && a.type !== 'Real Estate' && 
-                                    ((a.sipAmount > 0) || (profile.sipStrategy === 'Proportional' && a.sipProportion > 0)) &&
-                                    yearOffset >= a.sipStartYear && yearOffset <= a.sipEndYear
-                                );
-
-                                if (profile.sipStrategy === 'Proportional') {
-                                    // Proportional Logic
-                                    const totalWeight = activeSIPs.reduce((sum, a) => sum + (a.sipProportion || 0), 0);
-                                    if (totalWeight > 0) {
-                                        activeSIPs.forEach(asset => {
-                                            const share = (asset.sipProportion / totalWeight) * investableSurplus;
-                                            asset.currentBalance += share;
-                                            yearlySipInvested += share;
-                                        });
-                                    } else {
-                                         // Fallback to savings
-                                         const savings = simAssets.find(a => a.type === 'Liquid');
-                                         if(savings) savings.currentBalance += investableSurplus;
-                                    }
-                                } else {
-                                    // Fixed Amount Logic (Growth)
-                                    const sipDemandList = activeSIPs.map(asset => {
-                                        return { 
-                                            assetRef: asset, 
-                                            requiredAmount: asset.sipAmount * Math.pow(1 + (asset.sipGrowth||0)/100, yearOffset),
-                                            priority: asset.investmentPriority
-                                        };
-                                    });
-                                    
-                                    const totalSIPDemand = sipDemandList.reduce((sum, item) => sum + item.requiredAmount, 0);
-
-                                    if (totalSIPDemand > 0 && investableSurplus >= totalSIPDemand) {
-                                        let excess = investableSurplus - totalSIPDemand;
-                                        sipDemandList.forEach(item => {
-                                            item.assetRef.currentBalance += item.requiredAmount;
-                                            yearlySipInvested += item.requiredAmount;
-                                        });
-                                        // Dump excess into lowest priority investment (Liquid/Savings)
-                                        const parkingAsset = simAssets.find(a => a.type === 'Liquid');
-                                        if (parkingAsset) parkingAsset.currentBalance += excess;
-
-                                    } else {
-                                        // Scarcity: Fill by priority
-                                        let available = investableSurplus;
-                                        const sortedList = [...sipDemandList].sort((a, b) => a.priority - b.priority);
-                                        for (let item of sortedList) {
-                                            if (available <= 0) break;
-                                            let invest = Math.min(available, item.requiredAmount);
-                                            item.assetRef.currentBalance += invest;
-                                            yearlySipInvested += invest;
-                                            available -= invest;
-                                        }
-                                    }
-                                }
-                            }
+                        // Check Outcome
+                        const shadowLog = shadowResult.goalStatusLog.find(g => g.id === failed.id);
+                        if (shadowLog && ['Financed', 'Cashflow', 'Financed (Income DP)', 'Financed (Asset DP)', 'Financed (Hybrid DP)', 'Hybrid (Inc+Ast)', 'Asset Funded'].includes(shadowLog.status)) {
+                            newRecs.push({
+                                type: 'DELAY_GOAL',
+                                goalId: failed.id,
+                                goalName: failed.goal,
+                                cost: failed.cost,
+                                currentYear: originalGoal.yearOffset,
+                                recommendedYear: testOffset,
+                                delayYears: delay,
+                                impact: `Becomes fully affordable via ${shadowLog.status}.`
+                            });
+                            break; // Found shortest delay, stop looking
                         }
                     }
-
-                    // --- STEP 3: ASSET GROWTH ---
-                    simAssets.forEach(a => {
-                        let growth = a.currentBalance * (a.returnRate / 100);
-                        a.currentBalance += growth;
-                    });
-
-                    // Summary Calculations
-                    let totalRealEstateValue = simAssets.filter(a => a.type === 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
-                    let totalLiquidAssets = simAssets.filter(a => a.type !== 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
-                    let currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((s,a)=>s+a.currentBalance,0);
-                    
-                    let totalLiabilities = simLiabilities.reduce((sum, l) => sum + l.currentOutstanding, 0);
-                    let totalDynamicLoans = dynamicLoans.reduce((sum, l) => sum + l.outstanding, 0);
-                    
-                    let totalDebt = totalLiabilities + totalDynamicLoans;
-
-                    // Breakdown for stacked chart
-                    const assetBreakdown = simAssets.map(a => ({ name: a.name, value: a.currentBalance }));
-                    const liabilityBreakdown = [...simLiabilities, ...dynamicLoans].map(l => ({ name: l.name, value: l.currentOutstanding || l.outstanding }));
-
-                    timeline.push({
-                        year: currentYear,
-                        age: profile.currentAge + yearOffset,
-                        totalAssets: totalLiquidAssets + totalRealEstateValue,
-                        realEstateValue: totalRealEstateValue,
-                        liquidAssets: totalLiquidAssets,
-                        emergencyFund: currentEFValue,
-                        efTarget: emergencyFundTarget,
-                        totalLiabilities: totalDebt,
-                        netWorth: (totalLiquidAssets + totalRealEstateValue) - totalDebt,
-                        income: yearlyIncome,
-                        expense: yearlyExpense, // Includes Interest
-                        principalPaid: yearlyPrincipalPaid,
-                        invested: yearlySipInvested,
-                        assetBreakdown,
-                        liabilityBreakdown
-                    });
-
-                    if (currentEFValue < emergencyFundTarget * 0.5) {
-                         if (!alerts.find(a => a.year === currentYear && a.type.includes('Emergency'))) {
-                            alerts.push({ year: currentYear, type: 'Emergency Fund', message: `Emergency Fund critically low (${Math.round(currentEFValue/emergencyFundTarget*100)}%).` });
-                         }
-                    }
-                }
-                
-                // --- Evaluate Tenured Goal Status ---
-                const tenuredGoalStatusLog = tenuredGoals.map(tg => {
-                    const startYear = startYear + tg.startYearOffset;
-                    const endYear = startYear + tg.duration;
-                    
-                    // Check if any crisis occurred during this goal's tenure
-                    const crisisYears = alerts.filter(a => 
-                        a.type === 'Expense' && a.year >= startYear && a.year < endYear
-                    );
-
-                    let status = 'Funded';
-                    if (crisisYears.length > 0) status = 'At Risk';
-                    
-                    return { goal: tg.name, status, years: `${startYear}-${endYear}`, crisisCount: crisisYears.length };
                 });
 
-                setSimulationResults({ timeline, goalStatusLog, alerts, tenuredGoalStatusLog });
-            }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals]);
+                setRecommendations(newRecs);
+            }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals, planningHorizon]);
+
+            // Main Simulation Trigger
+            const calculateProjection = useCallback(() => {
+                const results = runSimulation({ profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals });
+                setSimulationResults(results);
+                generateRecommendations(results);
+            }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals, generateRecommendations]);
 
             useEffect(() => { const timer = setTimeout(() => calculateProjection(), 500); return () => clearTimeout(timer); }, [calculateProjection]);
 
-            // --- PDF Export Logic (High Fidelity) ---
+            // --- Handlers ---
+            const handleApplyRecommendation = (rec) => {
+                if (rec.type === 'DELAY_GOAL') {
+                    setOneTimeGoals(prev => prev.map(g => 
+                        g.id === rec.goalId ? { ...g, yearOffset: rec.recommendedYear } : g
+                    ));
+                    // Switch to dashboard to see results or stay to see rec disappear? 
+                    // Let's stay, but maybe flash a success message.
+                }
+            };
+
             const handleExportPDF = () => {
                 if(!simulationResults) return;
                 setIsExporting(true);
@@ -1026,6 +1104,19 @@
                             </button>
                         </div>
 
+                        {recommendations.length > 0 && (
+                            <div onClick={() => setActiveTab('advisor')} className="cursor-pointer bg-indigo-50 border border-indigo-200 p-4 rounded-xl flex items-center justify-between hover:bg-indigo-100 transition">
+                                <div className="flex items-center">
+                                    <div className="bg-indigo-600 text-white p-2 rounded-full mr-3"><i data-lucide="sparkles" className="w-5 h-5"></i></div>
+                                    <div>
+                                        <h3 className="font-bold text-indigo-900">Advisor Recommendations Available</h3>
+                                        <p className="text-indigo-700 text-sm">We found {recommendations.length} ways to fix your plan.</p>
+                                    </div>
+                                </div>
+                                <i data-lucide="chevron-right" className="text-indigo-400"></i>
+                            </div>
+                        )}
+
                         {alerts.length > 0 && (
                              <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-4 rounded shadow-sm">
                                 <h3 className="text-sm font-medium text-red-800">Critical Alerts</h3>
@@ -1149,14 +1240,42 @@
                                 <div className="flex items-center"><i data-lucide="trending-up" className="w-8 h-8 text-blue-600 mr-3"></i><h1 className="text-xl font-bold text-slate-800">Sovereign <span className="text-slate-400 font-normal text-sm ml-2">Personal Wealth Planner</span></h1></div>
                             </div>
                             <div className="flex overflow-x-auto no-scrollbar">
-                                {['dashboard','profile','incomes','expenses','assets','liabilities','goals'].map(id => (
-                                    <TabBtn key={id} id={id} label={id.charAt(0).toUpperCase() + id.slice(1)} icon={id==='dashboard'?'layout-dashboard': id==='profile'?'user': id==='incomes'?'arrow-down-circle': id==='expenses'?'arrow-up-circle': id==='assets'?'briefcase': id==='liabilities'?'credit-card': id==='goals'?'target':'pie-chart'} activeTab={activeTab} setActiveTab={setActiveTab} />
+                                {['dashboard', 'advisor', 'profile','incomes','expenses','assets','liabilities','goals'].map(id => (
+                                    <TabBtn 
+                                        key={id} 
+                                        id={id} 
+                                        label={id.charAt(0).toUpperCase() + id.slice(1)} 
+                                        icon={id==='dashboard'?'layout-dashboard': id==='advisor'?'sparkles': id==='profile'?'user': id==='incomes'?'arrow-down-circle': id==='expenses'?'arrow-up-circle': id==='assets'?'briefcase': id==='liabilities'?'credit-card': id==='goals'?'target':'pie-chart'} 
+                                        activeTab={activeTab} 
+                                        setActiveTab={setActiveTab} 
+                                    />
                                 ))}
                             </div>
                         </div>
                     </header>
                     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
                         {activeTab === 'dashboard' && <Dashboard simulationResults={simulationResults} />}
+                        {activeTab === 'advisor' && (
+                            <div className="max-w-4xl mx-auto">
+                                <div className="text-center mb-8">
+                                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Prescriptive Advisor</h2>
+                                    <p className="text-slate-500">The advisor runs shadow simulations to find solutions for your failed goals.</p>
+                                </div>
+                                {recommendations.length === 0 ? (
+                                    <div className="text-center p-12 bg-white rounded-xl shadow border border-slate-100">
+                                        <div className="bg-green-100 text-green-600 p-4 rounded-full inline-block mb-4"><i data-lucide="check" className="w-8 h-8"></i></div>
+                                        <h3 className="text-lg font-bold text-slate-700">All Goals Look Good!</h3>
+                                        <p className="text-slate-500 mt-2">No critical issues found in your current plan. Great job!</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {recommendations.map((rec, i) => (
+                                            <RecommendationCard key={i} rec={rec} onApply={handleApplyRecommendation} />
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        )}
                         {activeTab === 'profile' && (
                             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 max-w-3xl">
                                 <h3 className="text-lg font-semibold mb-4 text-slate-700">Financial Profile</h3>
