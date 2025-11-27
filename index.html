@@ -1,0 +1,1283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sovereign - Advanced Financial Planner v18</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- PDF Export Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+    
+    <!-- Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .chart-container { position: relative; height: 350px; width: 100%; }
+        input:focus, select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        input:disabled, select:disabled { background-color: #f1f5f9; color: #94a3b8; cursor: not-allowed; }
+        .status-badge { @apply px-2 py-1 rounded text-xs font-bold; }
+        .proj-table-container { max-height: 500px; overflow-y: auto; }
+        .proj-table th { position: sticky; top: 0; background: #f8fafc; z-index: 1; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef, useCallback } = React;
+        const { jsPDF } = window.jspdf;
+
+        // --- Utils & Constants ---
+        
+        const formatMoney = (amount) => {
+            if (amount === "" || amount === undefined || isNaN(amount)) return "";
+            return new Intl.NumberFormat('en-IN', { 
+                maximumFractionDigits: 0 
+            }).format(amount);
+        };
+
+        const parseMoney = (str) => {
+            if (!str) return 0;
+            return parseFloat(str.toString().replace(/,/g, '')) || 0;
+        };
+
+        const formatCurrencyDisplay = (amount) => {
+             if (isNaN(amount)) return "₹0";
+             return "₹" + formatMoney(amount);
+        };
+
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+
+        const calculateEMI = (principal, ratePercent, tenureYears) => {
+            if (!principal || !ratePercent || !tenureYears) return 0;
+            const r = ratePercent / 12 / 100;
+            const n = tenureYears * 12;
+            return (principal * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1);
+        };
+
+        // Color Palette for Stacked Chart
+        const chartColors = [
+            '#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#ec4899', 
+            '#6366f1', '#14b8a6', '#f97316', '#06b6d4', '#d946ef',
+            '#84cc16', '#ef4444', '#0ea5e9', '#eab308'
+        ];
+
+        // --- Initial Data Models ---
+        const initialProfile = {
+            name: "User",
+            currentAge: 33,
+            retirementAge: 55,
+            lifeExpectancy: 85,
+            inflation: 6,
+            spouseName: "Wife",
+            spouseAge: 32,
+            emergencyFundMonths: 6,
+            sipStrategy: 'Growth' // 'Growth' (Fixed %) or 'Proportional' (% of Surplus)
+        };
+
+        const initialIncomes = [
+            { id: 'inc1', name: "Primary Income", monthlyAmount: 122000, growthRate: 8, startYear: 0, endYear: 25 },
+            { id: 'inc2', name: "Secondary Income", monthlyAmount: 60000, growthRate: 5, startYear: 0, endYear: 20 },
+        ];
+
+        const initialExpenses = [
+            { id: 'exp1', name: "Rent", amount: 35000, frequency: "Monthly", inflation: 7, startYear: 0, endYear: 8 },
+            { id: 'exp2', name: "Living Expenses", amount: 40000, frequency: "Monthly", inflation: 6, startYear: 0, endYear: 50 },
+        ];
+
+        const initialAssets = [
+            { id: 'ast1', name: "Emergency Fund", type: "Emergency Fund", currentValue: 100000, returnRate: 5, investmentPriority: 0, liquidationPriority: 99, sipAmount: 0, sipGrowth: 0, sipProportion: 0, sipStartYear: 0, sipEndYear: 10 },
+            { id: 'ast2', name: "Savings Account", type: "Liquid", currentValue: 200000, returnRate: 4, investmentPriority: 3, liquidationPriority: 1, sipAmount: 5000, sipGrowth: 5, sipProportion: 20, sipStartYear: 0, sipEndYear: 10 },
+            { id: 'ast3', name: "Equity MF", type: "Growth", currentValue: 500000, returnRate: 12, investmentPriority: 1, liquidationPriority: 2, sipAmount: 20000, sipGrowth: 10, sipProportion: 50, sipStartYear: 0, sipEndYear: 15 },
+            { id: 'ast4', name: "PPF", type: "Locked", currentValue: 150000, returnRate: 7.1, investmentPriority: 2, liquidationPriority: 5, sipAmount: 12500, sipGrowth: 0, sipProportion: 30, sipStartYear: 0, sipEndYear: 15 },
+        ];
+
+        const initialLiabilities = [];
+
+        const initialOneTimeGoals = [
+            { id: 'goal1', name: "Buy House", cost: 8000000, type: "Need", yearOffset: 3, inflation: 5, fundingType: "Loan", downPaymentPercent: 20, loanInterest: 8.5, loanTenure: 20 },
+            { id: 'goal2', name: "Car Upgrade", cost: 1500000, type: "Desire", yearOffset: 5, inflation: 5, fundingType: "Loan", downPaymentPercent: 20, loanInterest: 9, loanTenure: 5 },
+            { id: 'goal3', name: "World Tour", cost: 800000, type: "Desire", yearOffset: 7, inflation: 6, fundingType: "Savings-Only", downPaymentPercent: 0, loanInterest: 0, loanTenure: 0 },
+        ];
+
+        const initialTenuredGoals = [
+             { id: 'tgoal1', name: "Child Higher Ed", annualCost: 1000000, startYearOffset: 15, duration: 4, inflation: 8 },
+        ];
+
+        // --- Shared Components ---
+        const ChartComponent = ({ type, data, options, id }) => {
+            const chartRef = useRef(null);
+            const canvasRef = useRef(null);
+            useEffect(() => {
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                chartRef.current = new Chart(ctx, { type, data, options });
+                return () => { if (chartRef.current) chartRef.current.destroy(); }
+            }, [data, options, type]);
+            return <div className="chart-container"><canvas id={id} ref={canvasRef}></canvas></div>;
+        };
+
+        const TabBtn = ({ id, label, icon, activeTab, setActiveTab }) => (
+            <button 
+                onClick={() => setActiveTab(id)}
+                className={`flex items-center px-4 py-3 text-sm font-medium border-b-2 transition-colors duration-200 whitespace-nowrap ${activeTab === id ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'}`}
+            >
+                <i data-lucide={icon} className="w-4 h-4 mr-2"></i>
+                {label}
+            </button>
+        );
+
+        const CurrencyInput = ({ value, onChange, disabled }) => {
+            const [displayVal, setDisplayVal] = useState(formatMoney(value));
+            useEffect(() => { setDisplayVal(formatMoney(value)); }, [value]);
+            const handleChange = (e) => {
+                const val = e.target.value;
+                if (/^[0-9,]*$/.test(val)) {
+                    setDisplayVal(val);
+                    onChange(parseMoney(val));
+                }
+            };
+            return (
+                <div className="relative">
+                    <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400">₹</span>
+                    <input type="text" value={displayVal} onChange={handleChange} disabled={disabled} className="block w-full pl-6 pr-2 py-1 text-sm border-slate-300 border rounded focus:ring-1 focus:ring-blue-500 focus:border-blue-500 disabled:bg-slate-100" />
+                </div>
+            );
+        };
+
+        const DataTable = ({ columns, data, setData, initialItem }) => {
+            const updateItem = useCallback((id, field, value, maxVal) => {
+                let finalVal = value;
+                if (maxVal !== undefined && typeof value === 'number' && value > maxVal) {
+                    finalVal = maxVal; // Enforce max
+                }
+                setData(prev => prev.map(item => item.id === id ? { ...item, [field]: finalVal } : item));
+            }, [setData]);
+
+            const addItem = useCallback(() => {
+                setData(prev => [...prev, { ...initialItem, id: generateId() }]);
+            }, [setData, initialItem]);
+            const deleteItem = useCallback((id) => {
+                setData(prev => prev.filter(i => i.id !== id));
+            }, [setData]);
+            const handleCalcEMI = (item) => {
+                const emi = calculateEMI(item.outstanding, item.interestRate, item.endDateOffset);
+                updateItem(item.id, 'emi', Math.round(emi));
+            };
+
+            return (
+                <div className="overflow-x-auto bg-white rounded-lg shadow border border-slate-200 mb-6">
+                    <table className="min-w-full divide-y divide-slate-200">
+                        <thead className="bg-slate-50">
+                            <tr>
+                                {columns.map(c => <th key={c.key} className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">
+                                    {c.label}
+                                    {c.max && typeof c.max !== 'function' && <span className="block text-[10px] text-slate-400 font-normal">Max: {c.max}</span>}
+                                    {c.max && typeof c.max === 'function' && <span className="block text-[10px] text-slate-400 font-normal">Dynamic Max</span>}
+                                </th>)}
+                                <th className="px-6 py-3 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-slate-200">
+                            {data.map(item => (
+                                <tr key={item.id}>
+                                    {columns.map(c => {
+                                        let disabled = false;
+                                        if (item.fundingType && c.key.includes('loan') && item.fundingType !== 'Loan') disabled = true;
+                                        if (item.fundingType && c.key === 'downPaymentPercent' && item.fundingType !== 'Loan') disabled = true;
+                                        
+                                        // Calculate Dynamic Max if function
+                                        const maxVal = typeof c.max === 'function' ? c.max(item) : c.max;
+
+                                        return (
+                                        <td key={c.key} className="px-6 py-4 whitespace-nowrap min-w-[150px]">
+                                            {c.type === 'select' ? (
+                                                <select value={item[c.key]} onChange={(e) => updateItem(item.id, c.key, e.target.value)} className="block w-full text-sm border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                                                    {c.options.map(o => <option key={o} value={o}>{o}</option>)}
+                                                </select>
+                                            ) : c.format === 'money' ? (
+                                                <CurrencyInput value={item[c.key]} disabled={disabled} onChange={(val) => updateItem(item.id, c.key, val)} />
+                                            ) : c.format === 'percent' ? (
+                                                <div className="relative">
+                                                    <input type="number" step="0.01" value={item[c.key]} disabled={disabled} onChange={(e) => updateItem(item.id, c.key, parseFloat(e.target.value) || 0)} className="block w-full pr-6 pl-2 py-1 text-sm border-slate-300 border rounded focus:ring-1 focus:ring-blue-500" />
+                                                    <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400">%</span>
+                                                </div>
+                                            ) : (
+                                                <input 
+                                                    type={c.type || "text"} 
+                                                    value={item[c.key]} 
+                                                    disabled={disabled} 
+                                                    max={maxVal}
+                                                    onChange={(e) => updateItem(item.id, c.key, c.type === 'number' ? parseFloat(e.target.value) : e.target.value, maxVal)} 
+                                                    className={`block w-full text-sm border-slate-300 rounded p-1 focus:ring-1 focus:ring-blue-500 disabled:bg-slate-100 ${maxVal !== undefined && item[c.key] > maxVal ? 'border-red-500 ring-1 ring-red-500' : ''}`} 
+                                                />
+                                            )}
+                                        </td>
+                                    )})}
+                                    <td className="px-6 py-4 text-right flex justify-end gap-2">
+                                        {initialItem.outstanding !== undefined && (
+                                            <button onClick={() => handleCalcEMI(item)} title="Calc EMI" className="text-blue-600 hover:text-blue-900 bg-blue-50 p-1 rounded"><i data-lucide="calculator" className="w-4 h-4"></i></button>
+                                        )}
+                                        <button onClick={() => deleteItem(item.id)} className="text-red-600 hover:text-red-900 p-1"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    <div className="p-4 border-t border-slate-200">
+                        <button onClick={addItem} className="flex items-center text-sm text-blue-600 hover:text-blue-800 font-medium"><i data-lucide="plus-circle" className="w-4 h-4 mr-1"></i> Add Row</button>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Core Application ---
+        const App = () => {
+            const [activeTab, setActiveTab] = useState("dashboard");
+            const [profile, setProfile] = useState(initialProfile);
+            const [incomes, setIncomes] = useState(initialIncomes);
+            const [expenses, setExpenses] = useState(initialExpenses);
+            const [assets, setAssets] = useState(initialAssets);
+            const [liabilities, setLiabilities] = useState(initialLiabilities);
+            const [oneTimeGoals, setOneTimeGoals] = useState(initialOneTimeGoals);
+            const [tenuredGoals, setTenuredGoals] = useState(initialTenuredGoals);
+            const [simulationResults, setSimulationResults] = useState(null);
+            const [isExporting, setIsExporting] = useState(false);
+
+            const planningHorizon = Math.max(0, profile.lifeExpectancy - profile.currentAge);
+
+            useEffect(() => {
+                const savedData = localStorage.getItem('finPlannerData_v17');
+                if (savedData) {
+                    try {
+                        const parsed = JSON.parse(savedData);
+                        setProfile(p => ({...p, ...parsed.profile}));
+                        if(parsed.incomes) setIncomes(parsed.incomes);
+                        if(parsed.expenses) setExpenses(parsed.expenses);
+                        if(parsed.assets) setAssets(parsed.assets);
+                        if(parsed.liabilities) setLiabilities(parsed.liabilities);
+                        if(parsed.oneTimeGoals) setOneTimeGoals(parsed.oneTimeGoals);
+                        if(parsed.tenuredGoals) setTenuredGoals(parsed.tenuredGoals);
+                    } catch (e) { console.error("Load error", e); }
+                }
+            }, []);
+
+            useEffect(() => {
+                const data = { profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals };
+                localStorage.setItem('finPlannerData_v17', JSON.stringify(data));
+            }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals]);
+
+            const calculateProjection = useCallback(() => {
+                // ... existing simulation logic (unchanged) ...
+                // Initialize Simulation Assets
+                let simAssets = assets.map(a => ({ 
+                    ...a, 
+                    currentBalance: parseFloat(a.currentValue) || 0,
+                    sipAmount: parseFloat(a.sipAmount) || 0,
+                    sipStartYear: parseInt(a.sipStartYear) || 0,
+                    sipEndYear: parseInt(a.sipEndYear) || 0,
+                    isEmergencyFund: a.type === 'Emergency Fund'
+                }));
+                
+                let simLiabilities = liabilities.map(l => ({ ...l, currentOutstanding: parseFloat(l.outstanding) || 0 }));
+                let dynamicLoans = []; 
+
+                const timeline = [];
+                const maxYear = Math.max(profile.lifeExpectancy - profile.currentAge, 40); 
+                const startYear = new Date().getFullYear();
+                let goalStatusLog = [];
+                let alerts = [];
+
+                for (let yearOffset = 0; yearOffset <= maxYear; yearOffset++) {
+                    const currentYear = startYear + yearOffset;
+                    
+                    // 1. Calculate Annual Income and Expenses for Surplus Check
+                    let projectedAnnualIncome = 0;
+                    incomes.forEach(inc => {
+                        if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
+                             projectedAnnualIncome += ((parseFloat(inc.monthlyAmount)||0) * 12 * Math.pow(1 + inc.growthRate/100, yearOffset));
+                        }
+                    });
+
+                    let projectedAnnualLivingExpenses = 0;
+                    expenses.forEach(exp => {
+                         if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
+                            let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + (exp.inflation || profile.inflation) / 100, yearOffset);
+                            if (exp.frequency === 'Monthly') projectedAnnualLivingExpenses += (amt * 12);
+                            else projectedAnnualLivingExpenses += amt;
+                        }
+                    });
+
+                    // Approximate annual debt service (existing loans)
+                    let approxAnnualDebt = 0;
+                    [...simLiabilities, ...dynamicLoans].forEach(l => {
+                        let balance = l.currentOutstanding || l.outstanding;
+                        if(balance > 0) approxAnnualDebt += (l.emi * 12);
+                    });
+
+                    // Initial Surplus Available for Goals
+                    let projectedAnnualSurplus = projectedAnnualIncome - projectedAnnualLivingExpenses - approxAnnualDebt;
+                    let cashflowFundedGoalsCost = 0; // Track amount paid from income in Month 0
+
+                    const emergencyFundTarget = (projectedAnnualLivingExpenses / 12) * (profile.emergencyFundMonths || 6);
+
+                    let yearlyIncome = 0;
+                    let yearlyExpense = 0; // Pure expense (Spending + Interest)
+                    let yearlyPrincipalPaid = 0; // Wealth building
+                    let yearlySipInvested = 0;
+                    
+                    // --- STEP 1: GOAL PROCESSING (Start of Year) ---
+                    oneTimeGoals.forEach(goal => {
+                        if (goal.yearOffset === yearOffset) {
+                            const goalInflation = (goal.inflation !== undefined && goal.inflation !== "") ? goal.inflation : profile.inflation;
+                            const cost = (parseFloat(goal.cost) || 0) * Math.pow(1 + goalInflation / 100, yearOffset);
+                            
+                            const isRealEstate = /home|house|property|apartment|flat/i.test(goal.name);
+
+                            // Calculate Amount needed Upfront (Total Cost or Down Payment)
+                            let amountNeededUpfront = cost;
+                            let loanAmount = 0;
+                            if (goal.fundingType === 'Loan') {
+                                const dpAmount = cost * (goal.downPaymentPercent / 100);
+                                amountNeededUpfront = dpAmount;
+                                loanAmount = cost - dpAmount;
+                            }
+
+                            // --- HYBRID FUNDING LOGIC ---
+                            let funded = false;
+                            let status = "Failed";
+                            let reason = "";
+                            
+                            // 1. Identify Eligible Assets for Fallback
+                            let eligibleAssets = [];
+                            if (goal.fundingType === 'Savings-Only') {
+                                eligibleAssets = simAssets.filter(a => a.type === 'Liquid');
+                            } else if (goal.fundingType !== 'Income-Only') {
+                                eligibleAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate');
+                            }
+                            eligibleAssets.sort((a, b) => a.liquidationPriority - b.liquidationPriority); // Low priority first
+
+                            const totalEligibleAssetValue = eligibleAssets.reduce((sum, a) => sum + a.currentBalance, 0);
+                            const totalCapacity = projectedAnnualSurplus + (goal.fundingType === 'Income-Only' ? 0 : totalEligibleAssetValue);
+
+                            // 2. Feasibility Check
+                            // If Desire goal: Don't touch ANYTHING if total capacity < cost (preserve surplus & assets)
+                            if (goal.type === 'Desire' && (totalCapacity < amountNeededUpfront || (totalCapacity + totalEligibleAssetValue - amountNeededUpfront - loanAmount < 0))) {
+                                status = "Skipped"; 
+                                reason = totalCapacity < amountNeededUpfront ? "Insufficient Total Funds" : "Negative NW Impact";
+                            } 
+                            else {
+                                // It's feasible (or a Need that we must try to fund)
+                                let remainingToPay = amountNeededUpfront;
+                                let incomeContribution = 0;
+
+                                // A. Pay from Income Surplus First
+                                if (projectedAnnualSurplus > 0) {
+                                    incomeContribution = Math.min(projectedAnnualSurplus, remainingToPay);
+                                    projectedAnnualSurplus -= incomeContribution;
+                                    cashflowFundedGoalsCost += incomeContribution;
+                                    remainingToPay -= incomeContribution;
+                                }
+
+                                // B. Pay Balance from Assets
+                                if (remainingToPay > 0 && goal.fundingType !== 'Income-Only') {
+                                    for (let asset of eligibleAssets) {
+                                        if (remainingToPay <= 0) break;
+                                        let take = Math.min(asset.currentBalance, remainingToPay);
+                                        asset.currentBalance -= take;
+                                        remainingToPay -= take;
+                                    }
+                                }
+
+                                // C. Final Outcome
+                                if (remainingToPay <= 1) {
+                                    funded = true;
+                                    if (incomeContribution >= amountNeededUpfront) {
+                                        status = goal.fundingType === 'Loan' ? "Financed (Income DP)" : "Cashflow";
+                                    } else if (incomeContribution > 0) {
+                                        status = goal.fundingType === 'Loan' ? "Financed (Hybrid DP)" : "Hybrid (Inc+Ast)";
+                                    } else {
+                                        status = goal.fundingType === 'Loan' ? "Financed (Asset DP)" : "Asset Funded";
+                                    }
+
+                                    // Handle Loan Creation
+                                    if (goal.fundingType === 'Loan' && loanAmount > 0) {
+                                        const newEMI = calculateEMI(loanAmount, goal.loanInterest, goal.loanTenure);
+                                        dynamicLoans.push({ 
+                                            id: `goal_loan_${goal.id}`, name: goal.name + " Loan", 
+                                            outstanding: loanAmount, rate: goal.loanInterest, emi: newEMI, 
+                                            tenure: goal.loanTenure, isRealEstateLoan: isRealEstate 
+                                        });
+                                    }
+                                } else {
+                                    // Failed despite trying (Only happens for Needs or if Math was tight)
+                                    status = goal.fundingType === 'Loan' ? "DP Shortfall" : "Shortfall";
+                                    reason = "Assets Depleted";
+                                }
+                            }
+
+                            if (funded && isRealEstate) {
+                                // Add Property Asset
+                                simAssets.push({
+                                    id: `prop_${goal.id}`,
+                                    name: goal.name,
+                                    type: 'Real Estate',
+                                    currentBalance: cost,
+                                    returnRate: goalInflation, // Appreciate at goal's inflation rate
+                                    investmentPriority: 99,
+                                    liquidationPriority: 99,
+                                    sipAmount: 0
+                                });
+                            }
+                            
+                            goalStatusLog.push({ year: currentYear, goal: goal.name, status, cost, deficit: !funded ? cost : 0, reason });
+                        }
+                    });
+
+                    // --- STEP 2: MONTHLY CASHFLOW LOOP ---
+                    for (let m = 0; m < 12; m++) {
+                        let monthlyCashIn = 0;
+                        let monthlyCashOut = 0; 
+                        let monthlyInterestPaid = 0;
+                        let monthlyPrincipalPaid = 0;
+                        
+                        // Income
+                        incomes.forEach(inc => {
+                            if (yearOffset >= inc.startYear && yearOffset <= inc.endYear) {
+                                monthlyCashIn += (parseFloat(inc.monthlyAmount) || 0) * Math.pow(1 + inc.growthRate / 100, yearOffset);
+                            }
+                        });
+
+                        // Expenses
+                        expenses.forEach(exp => {
+                            if (yearOffset >= exp.startYear && yearOffset <= exp.endYear) {
+                                let infl = (exp.inflation !== undefined && exp.inflation !== "") ? exp.inflation : profile.inflation;
+                                let amt = (parseFloat(exp.amount) || 0) * Math.pow(1 + infl / 100, yearOffset);
+                                if (exp.frequency === 'Annual') {
+                                    if (m === 0) monthlyCashOut += amt; 
+                                } else {
+                                    monthlyCashOut += amt;
+                                }
+                            }
+                        });
+
+                        // Pay Income-Funded Goal Costs in Month 0
+                        if (m === 0 && cashflowFundedGoalsCost > 0) {
+                            monthlyCashOut += cashflowFundedGoalsCost;
+                        }
+
+                        // Tenured Goals
+                        tenuredGoals.forEach(tg => {
+                            if (yearOffset >= tg.startYearOffset && yearOffset < (tg.startYearOffset + tg.duration)) {
+                                const tgInflation = (tg.inflation !== undefined && tg.inflation !== "") ? tg.inflation : profile.inflation;
+                                const annualCost = (parseFloat(tg.annualCost) || 0) * Math.pow(1 + tgInflation / 100, yearOffset);
+                                if (m === 5) monthlyCashOut += annualCost;
+                            }
+                        });
+
+                        // Liability Amortization
+                        const processLoan = (loanObj, isDynamic = false) => {
+                            let balance = isDynamic ? loanObj.outstanding : loanObj.currentOutstanding;
+                            if (balance > 10) {
+                                let rate = isDynamic ? loanObj.rate : loanObj.interestRate;
+                                let emi = parseFloat(loanObj.emi) || 0;
+                                
+                                // Recalc EMI if 0 (only for existing liabilities, dynamic ones have emi set)
+                                if (emi === 0 && balance > 0) emi = calculateEMI(balance, rate, 10);
+                                
+                                let interest = balance * (rate / 100) / 12;
+                                if (balance + interest < emi) emi = balance + interest;
+                                
+                                let principal = emi - interest;
+                                if (principal < 0) principal = 0; // Negative amortization guard
+
+                                if (isDynamic) loanObj.outstanding -= principal;
+                                else loanObj.currentOutstanding -= principal;
+
+                                monthlyInterestPaid += interest;
+                                monthlyPrincipalPaid += principal;
+                                monthlyCashOut += emi;
+                            }
+                        };
+
+                        simLiabilities.forEach(l => processLoan(l, false));
+                        dynamicLoans.forEach(l => processLoan(l, true));
+
+                        yearlyIncome += monthlyCashIn;
+                        yearlyExpense += (monthlyCashOut - monthlyPrincipalPaid); // Expense includes Interest, excludes Principal
+                        yearlyPrincipalPaid += monthlyPrincipalPaid;
+                        
+                        let monthlySurplus = monthlyCashIn - monthlyCashOut;
+
+                        // --- SOLVENCY & LIQUIDATION ---
+                        if (monthlySurplus < 0) {
+                            let deficit = Math.abs(monthlySurplus);
+                            // Don't liquidate EF or Real Estate first
+                            const liquidatableAssets = simAssets.filter(a => !a.isEmergencyFund && a.type !== 'Real Estate')
+                                                              .sort((a, b) => a.liquidationPriority - b.liquidationPriority);
+                             
+                            for (let asset of liquidatableAssets) {
+                                if (deficit <= 1) break; 
+                                if (asset.currentBalance > 0) {
+                                    let withdraw = Math.min(asset.currentBalance, deficit);
+                                    asset.currentBalance -= withdraw;
+                                    deficit -= withdraw;
+                                }
+                            }
+
+                            // If still deficit, try Emergency Fund
+                            if (deficit > 1) {
+                                const efAssets = simAssets.filter(a => a.isEmergencyFund);
+                                for (let asset of efAssets) {
+                                    if (deficit <= 1) break;
+                                    if (asset.currentBalance > 0) {
+                                        let withdraw = Math.min(asset.currentBalance, deficit);
+                                        asset.currentBalance -= withdraw;
+                                        deficit -= withdraw;
+                                    }
+                                }
+                            }
+
+                            if (deficit > 100) {
+                                if (!alerts.find(a => a.year === currentYear && a.type === 'Expense')) {
+                                    alerts.push({ year: currentYear, type: 'Expense', message: `Cashflow Crisis: Unfunded monthly expenses of ${formatCurrencyDisplay(deficit)}.` });
+                                }
+                                monthlySurplus = 0;
+                            }
+                        } else {
+                            // --- SURPLUS ALLOCATION ---
+                            
+                            // 1. Emergency Fund Top-Up
+                            const currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((sum, a) => sum + a.currentBalance, 0);
+                            let investableSurplus = monthlySurplus;
+
+                            if (currentEFValue < emergencyFundTarget) {
+                                const efGap = emergencyFundTarget - currentEFValue;
+                                const toEF = Math.min(investableSurplus, efGap);
+                                
+                                // Distribute to EF assets
+                                const efAssets = simAssets.filter(a => a.isEmergencyFund);
+                                if (efAssets.length > 0) {
+                                    // Split equally or to first
+                                    efAssets[0].currentBalance += toEF;
+                                    investableSurplus -= toEF;
+                                    // Add to yearly invested? Technically yes, into savings
+                                }
+                            }
+
+                            // 2. SIP Allocation (with remaining surplus)
+                            if (investableSurplus > 0) {
+                                const activeSIPs = simAssets.filter(a => 
+                                    !a.isEmergencyFund && a.type !== 'Real Estate' && 
+                                    ((a.sipAmount > 0) || (profile.sipStrategy === 'Proportional' && a.sipProportion > 0)) &&
+                                    yearOffset >= a.sipStartYear && yearOffset <= a.sipEndYear
+                                );
+
+                                if (profile.sipStrategy === 'Proportional') {
+                                    // Proportional Logic
+                                    const totalWeight = activeSIPs.reduce((sum, a) => sum + (a.sipProportion || 0), 0);
+                                    if (totalWeight > 0) {
+                                        activeSIPs.forEach(asset => {
+                                            const share = (asset.sipProportion / totalWeight) * investableSurplus;
+                                            asset.currentBalance += share;
+                                            yearlySipInvested += share;
+                                        });
+                                    } else {
+                                         // Fallback to savings
+                                         const savings = simAssets.find(a => a.type === 'Liquid');
+                                         if(savings) savings.currentBalance += investableSurplus;
+                                    }
+                                } else {
+                                    // Fixed Amount Logic (Growth)
+                                    const sipDemandList = activeSIPs.map(asset => {
+                                        return { 
+                                            assetRef: asset, 
+                                            requiredAmount: asset.sipAmount * Math.pow(1 + (asset.sipGrowth||0)/100, yearOffset),
+                                            priority: asset.investmentPriority
+                                        };
+                                    });
+                                    
+                                    const totalSIPDemand = sipDemandList.reduce((sum, item) => sum + item.requiredAmount, 0);
+
+                                    if (totalSIPDemand > 0 && investableSurplus >= totalSIPDemand) {
+                                        let excess = investableSurplus - totalSIPDemand;
+                                        sipDemandList.forEach(item => {
+                                            item.assetRef.currentBalance += item.requiredAmount;
+                                            yearlySipInvested += item.requiredAmount;
+                                        });
+                                        // Dump excess into lowest priority investment (Liquid/Savings)
+                                        const parkingAsset = simAssets.find(a => a.type === 'Liquid');
+                                        if (parkingAsset) parkingAsset.currentBalance += excess;
+
+                                    } else {
+                                        // Scarcity: Fill by priority
+                                        let available = investableSurplus;
+                                        const sortedList = [...sipDemandList].sort((a, b) => a.priority - b.priority);
+                                        for (let item of sortedList) {
+                                            if (available <= 0) break;
+                                            let invest = Math.min(available, item.requiredAmount);
+                                            item.assetRef.currentBalance += invest;
+                                            yearlySipInvested += invest;
+                                            available -= invest;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- STEP 3: ASSET GROWTH ---
+                    simAssets.forEach(a => {
+                        let growth = a.currentBalance * (a.returnRate / 100);
+                        a.currentBalance += growth;
+                    });
+
+                    // Summary Calculations
+                    let totalRealEstateValue = simAssets.filter(a => a.type === 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
+                    let totalLiquidAssets = simAssets.filter(a => a.type !== 'Real Estate').reduce((s,a)=>s+a.currentBalance,0);
+                    let currentEFValue = simAssets.filter(a => a.isEmergencyFund).reduce((s,a)=>s+a.currentBalance,0);
+                    
+                    let totalLiabilities = simLiabilities.reduce((sum, l) => sum + l.currentOutstanding, 0);
+                    let totalDynamicLoans = dynamicLoans.reduce((sum, l) => sum + l.outstanding, 0);
+                    
+                    let totalDebt = totalLiabilities + totalDynamicLoans;
+
+                    // Breakdown for stacked chart
+                    const assetBreakdown = simAssets.map(a => ({ name: a.name, value: a.currentBalance }));
+                    const liabilityBreakdown = [...simLiabilities, ...dynamicLoans].map(l => ({ name: l.name, value: l.currentOutstanding || l.outstanding }));
+
+                    timeline.push({
+                        year: currentYear,
+                        age: profile.currentAge + yearOffset,
+                        totalAssets: totalLiquidAssets + totalRealEstateValue,
+                        realEstateValue: totalRealEstateValue,
+                        liquidAssets: totalLiquidAssets,
+                        emergencyFund: currentEFValue,
+                        efTarget: emergencyFundTarget,
+                        totalLiabilities: totalDebt,
+                        netWorth: (totalLiquidAssets + totalRealEstateValue) - totalDebt,
+                        income: yearlyIncome,
+                        expense: yearlyExpense, // Includes Interest
+                        principalPaid: yearlyPrincipalPaid,
+                        invested: yearlySipInvested,
+                        assetBreakdown,
+                        liabilityBreakdown
+                    });
+
+                    if (currentEFValue < emergencyFundTarget * 0.5) {
+                         if (!alerts.find(a => a.year === currentYear && a.type.includes('Emergency'))) {
+                            alerts.push({ year: currentYear, type: 'Emergency Fund', message: `Emergency Fund critically low (${Math.round(currentEFValue/emergencyFundTarget*100)}%).` });
+                         }
+                    }
+                }
+                
+                // --- Evaluate Tenured Goal Status ---
+                const tenuredGoalStatusLog = tenuredGoals.map(tg => {
+                    const startYear = startYear + tg.startYearOffset;
+                    const endYear = startYear + tg.duration;
+                    
+                    // Check if any crisis occurred during this goal's tenure
+                    const crisisYears = alerts.filter(a => 
+                        a.type === 'Expense' && a.year >= startYear && a.year < endYear
+                    );
+
+                    let status = 'Funded';
+                    if (crisisYears.length > 0) status = 'At Risk';
+                    
+                    return { goal: tg.name, status, years: `${startYear}-${endYear}`, crisisCount: crisisYears.length };
+                });
+
+                setSimulationResults({ timeline, goalStatusLog, alerts, tenuredGoalStatusLog });
+            }, [profile, incomes, expenses, assets, liabilities, oneTimeGoals, tenuredGoals]);
+
+            useEffect(() => { const timer = setTimeout(() => calculateProjection(), 500); return () => clearTimeout(timer); }, [calculateProjection]);
+
+            // --- PDF Export Logic (High Fidelity) ---
+            const handleExportPDF = () => {
+                if(!simulationResults) return;
+                setIsExporting(true);
+                const doc = new jsPDF();
+                const fmt = (v) => formatCurrencyDisplay(v || 0);
+                const dateStr = new Date().toLocaleDateString();
+
+                // --- Helper: Draw Header ---
+                const drawHeader = (doc) => {
+                    doc.setFillColor(30, 41, 59); // Slate 800
+                    doc.rect(0, 0, 210, 25, 'F');
+                    doc.setFontSize(18);
+                    doc.setTextColor(255, 255, 255);
+                    doc.text("Sovereign Financial Plan", 14, 16);
+                    doc.setFontSize(10);
+                    doc.setTextColor(148, 163, 184); // Slate 400
+                    doc.text(`Generated for ${profile.name} | ${dateStr}`, 200, 16, { align: 'right' });
+                };
+
+                // --- PAGE 1: DASHBOARD ---
+                drawHeader(doc);
+                
+                // 1. Status Banner
+                const hasFailedGoals = simulationResults.goalStatusLog.some(g => ['Failed', 'Skipped', 'Shortfall', 'DP Shortfall'].includes(g.status));
+                const hasRiskyTenure = simulationResults.tenuredGoalStatusLog.some(g => g.status === 'At Risk');
+                const hasCrisis = simulationResults.alerts.some(a => a.type === 'Expense');
+                const isSuccess = !hasFailedGoals && !hasRiskyTenure && !hasCrisis;
+
+                doc.setFillColor(isSuccess ? 240 : 254, isSuccess ? 253 : 242, isSuccess ? 244 : 242); // bg-green-50 or bg-red-50
+                doc.setDrawColor(isSuccess ? 34 : 239, isSuccess ? 197 : 68, isSuccess ? 94 : 68); // border-green-500 or border-red-500
+                doc.setLineWidth(1);
+                doc.roundedRect(14, 35, 182, 20, 2, 2, 'FD');
+                
+                doc.setFontSize(14);
+                doc.setTextColor(isSuccess ? 22 : 153, isSuccess ? 101 : 27, isSuccess ? 52 : 27);
+                doc.text(isSuccess ? "Successful Plan" : "Plan Needs Attention", 20, 47);
+                doc.setFontSize(10);
+                doc.setTextColor(71, 85, 105);
+                doc.text(isSuccess ? "All goals funded & solvent." : "You have unfunded goals or cashflow crises.", 20, 52);
+
+                // 2. Key Metrics
+                const currentNW = simulationResults.timeline[0].netWorth;
+                const retireData = simulationResults.timeline.find(t => t.age === profile.retirementAge) || simulationResults.timeline[simulationResults.timeline.length - 1];
+                const deathData = simulationResults.timeline.find(t => t.age === profile.lifeExpectancy) || simulationResults.timeline[simulationResults.timeline.length - 1];
+
+                const drawCard = (x, title, value, sub) => {
+                    doc.setFillColor(255, 255, 255);
+                    doc.setDrawColor(226, 232, 240);
+                    doc.roundedRect(x, 65, 55, 25, 2, 2, 'FD');
+                    doc.setFontSize(8);
+                    doc.setTextColor(100);
+                    doc.text(title, x + 4, 71);
+                    doc.setFontSize(12);
+                    doc.setTextColor(0);
+                    doc.text(value, x + 4, 78);
+                    doc.setFontSize(8);
+                    doc.setTextColor(150);
+                    doc.text(sub, x + 4, 85);
+                };
+
+                drawCard(14, "Current Net Worth", fmt(currentNW), `Age ${profile.currentAge}`);
+                drawCard(77, "At Retirement", fmt(retireData?.netWorth), `Age ${profile.retirementAge}`);
+                drawCard(140, "Legacy (End of Life)", fmt(deathData?.netWorth), `Age ${profile.lifeExpectancy}`);
+
+                // 3. Charts (High Res Capture)
+                try {
+                    const nwCanvas = document.getElementById('nwChart');
+                    const cfCanvas = document.getElementById('cfChart');
+                    if (nwCanvas) {
+                        const nwImg = nwCanvas.toDataURL('image/png', 1.0);
+                        doc.addImage(nwImg, 'PNG', 14, 100, 182, 90);
+                        doc.setFontSize(10); doc.setTextColor(0); doc.text("Net Worth Composition", 14, 98);
+                    }
+                    if (cfCanvas) {
+                        doc.addPage(); // Move CF chart to Page 2 top
+                        drawHeader(doc);
+                        const cfImg = cfCanvas.toDataURL('image/png', 1.0);
+                        doc.addImage(cfImg, 'PNG', 14, 35, 182, 90);
+                        doc.setFontSize(10); doc.setTextColor(0); doc.text("Cash Flow Analysis", 14, 33);
+                    }
+                } catch(e) { console.log("Chart capture error", e); }
+
+                // --- PAGE 2 continued: GOALS STATUS ---
+                let yPos = 135;
+                doc.setFontSize(12);
+                doc.text("Goal Status Report", 14, yPos);
+                
+                const goalRows = simulationResults.goalStatusLog.map(g => [g.year, g.goal, g.status, g.deficit > 0 ? fmt(g.deficit) : '-', g.reason || '-']);
+                doc.autoTable({
+                    startY: yPos + 5,
+                    head: [['Year', 'Goal', 'Status', 'Shortfall', 'Notes']],
+                    body: goalRows,
+                    theme: 'grid',
+                    headStyles: { fillColor: [51, 65, 85] },
+                    styles: { fontSize: 9 },
+                    columnStyles: { 2: { fontStyle: 'bold' } },
+                    didParseCell: function(data) {
+                        if (data.section === 'body' && data.column.index === 2) {
+                            const s = data.cell.raw;
+                            if (s.includes('Skipped') || s.includes('Shortfall')) data.cell.styles.textColor = [220, 38, 38];
+                            else data.cell.styles.textColor = [22, 163, 74];
+                        }
+                    }
+                });
+
+                // --- PAGE 3: FINANCIAL PROFILE ---
+                doc.addPage();
+                drawHeader(doc);
+                doc.setFontSize(14);
+                doc.text("Financial Profile & Inputs", 14, 35);
+
+                let finalY = 40;
+
+                // Incomes
+                doc.setFontSize(11); doc.text("Incomes", 14, finalY);
+                doc.autoTable({
+                    startY: finalY + 2,
+                    head: [['Source', 'Monthly Amt', 'Growth %', 'Start Yr', 'End Yr']],
+                    body: incomes.map(i => [i.name, fmt(i.monthlyAmount), i.growthRate+'%', i.startYear, i.endYear]),
+                    theme: 'striped',
+                    styles: { fontSize: 9 },
+                    headStyles: { fillColor: [16, 185, 129] } // Green
+                });
+                finalY = doc.lastAutoTable.finalY + 10;
+
+                // Expenses
+                doc.text("Expenses", 14, finalY);
+                doc.autoTable({
+                    startY: finalY + 2,
+                    head: [['Category', 'Amount', 'Freq', 'Inflation %', 'Duration']],
+                    body: expenses.map(e => [e.name, fmt(e.amount), e.frequency, e.inflation+'%', e.endYear]),
+                    theme: 'striped',
+                    styles: { fontSize: 9 },
+                    headStyles: { fillColor: [239, 68, 68] } // Red
+                });
+                finalY = doc.lastAutoTable.finalY + 10;
+
+                // Assets
+                doc.text("Assets & SIPs", 14, finalY);
+                doc.autoTable({
+                    startY: finalY + 2,
+                    head: [['Asset', 'Type', 'Current Val', 'Return %', 'SIP Amt/Prop', 'SIP Years']],
+                    body: assets.map(a => [
+                        a.name, a.type, fmt(a.currentValue), a.returnRate+'%', 
+                        profile.sipStrategy === 'Growth' ? fmt(a.sipAmount) : a.sipProportion+'%', 
+                        `${a.sipStartYear}-${a.sipEndYear}`
+                    ]),
+                    theme: 'striped',
+                    styles: { fontSize: 9 },
+                    headStyles: { fillColor: [59, 130, 246] } // Blue
+                });
+                
+                // --- PAGE 4: PROJECTIONS ---
+                doc.addPage();
+                drawHeader(doc);
+                doc.setFontSize(14);
+                doc.text("Detailed Annual Projections", 14, 35);
+                
+                doc.autoTable({
+                    startY: 40,
+                    head: [['Year', 'Age', 'Income', 'Expense', 'Equity Paid', 'Invested', 'Assets', 'Liabilities', 'Net Worth']],
+                    body: simulationResults.timeline.map(t => [
+                        t.year, t.age, 
+                        fmt(t.income), fmt(t.expense), 
+                        fmt(t.principalPaid), fmt(t.invested), 
+                        fmt(t.totalAssets), fmt(t.totalLiabilities), 
+                        fmt(t.netWorth)
+                    ]),
+                    theme: 'striped',
+                    styles: { fontSize: 8, cellPadding: 1.5 },
+                    headStyles: { fillColor: [30, 41, 59] },
+                    columnStyles: {
+                        8: { fontStyle: 'bold', textColor: [30, 41, 59] } // Net Worth Column
+                    }
+                });
+
+                doc.save(`Sovereign_Plan_${profile.name}.pdf`);
+                setIsExporting(false);
+            };
+
+            const Dashboard = ({ simulationResults }) => {
+                if (!simulationResults) return <div className="p-8 text-center text-slate-500">Generating Projection...</div>;
+                const { timeline, goalStatusLog, alerts, tenuredGoalStatusLog } = simulationResults;
+                
+                // --- Metrics Calculations ---
+                const currentNW = timeline[0].netWorth;
+                
+                // Net Worth at Retirement
+                const retireData = timeline.find(t => t.age === profile.retirementAge) || timeline[timeline.length - 1];
+                const retireNW = retireData ? retireData.netWorth : 0;
+
+                // Net Worth at Death (Legacy)
+                const deathData = timeline.find(t => t.age === profile.lifeExpectancy) || timeline[timeline.length - 1];
+                const deathNW = deathData ? deathData.netWorth : 0;
+
+                // Overall Plan Status Logic
+                const hasFailedGoals = goalStatusLog.some(g => ['Failed', 'Skipped', 'Shortfall', 'DP Shortfall'].includes(g.status));
+                const hasRiskyTenure = tenuredGoalStatusLog.some(g => g.status === 'At Risk');
+                const hasCrisis = alerts.some(a => a.type === 'Expense'); // Cashflow crisis
+                
+                const isPlanSuccess = !hasFailedGoals && !hasRiskyTenure && !hasCrisis;
+
+                // --- Stacked Net Worth Chart Logic ---
+                const netWorthChartData = useMemo(() => {
+                    const uniqueAssets = new Set();
+                    const uniqueLiabilities = new Set();
+
+                    timeline.forEach(t => {
+                        t.assetBreakdown.forEach(a => uniqueAssets.add(a.name));
+                        t.liabilityBreakdown.forEach(l => uniqueLiabilities.add(l.name));
+                    });
+                    
+                    const assetList = Array.from(uniqueAssets);
+                    const liabilityList = Array.from(uniqueLiabilities);
+
+                    const datasets = [];
+
+                    // Assets
+                    assetList.forEach((assetName, idx) => {
+                        datasets.push({
+                            label: assetName,
+                            data: timeline.map(t => {
+                                const item = t.assetBreakdown.find(a => a.name === assetName);
+                                return item ? item.value : 0;
+                            }),
+                            backgroundColor: chartColors[idx % chartColors.length],
+                            borderColor: chartColors[idx % chartColors.length],
+                            fill: true,
+                            stack: 'stack0'
+                        });
+                    });
+
+                    // Liabilities
+                    liabilityList.forEach((liabName, idx) => {
+                        datasets.push({
+                            label: liabName,
+                            data: timeline.map(t => {
+                                const item = t.liabilityBreakdown.find(l => l.name === liabName);
+                                return item ? -item.value : 0;
+                            }),
+                            backgroundColor: '#ef4444', 
+                            borderColor: '#ef4444',
+                            fill: true,
+                            stack: 'stack0' 
+                        });
+                    });
+
+                    // Net Worth Line
+                    datasets.push({
+                        label: 'Net Worth',
+                        type: 'line',
+                        data: timeline.map(t => t.netWorth),
+                        borderColor: '#000000',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                        stack: 'nw'
+                    });
+
+                    return {
+                        labels: timeline.map(t => t.year),
+                        datasets: datasets
+                    };
+                }, [timeline]);
+
+                const stackedOptions = {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { stacked: true },
+                        y: { stacked: true }
+                    },
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) { label += ': '; }
+                                    if (context.parsed.y !== null) { label += formatMoney(Math.abs(context.parsed.y)); }
+                                    return label;
+                                }
+                            }
+                        }
+                    }
+                };
+                
+                const cashFlowChartData = {
+                    labels: timeline.map(t => t.year),
+                    datasets: [
+                        { label: 'Income', data: timeline.map(t => t.income), borderColor: '#10b981', backgroundColor: '#10b981', tension: 0.2 },
+                        { label: 'Expense', data: timeline.map(t => t.expense), borderColor: '#ef4444', backgroundColor: '#ef4444', tension: 0.2 },
+                        { label: 'Equity Built', data: timeline.map(t => t.principalPaid), borderColor: '#f59e0b', backgroundColor: '#f59e0b', tension: 0.2 }
+                    ]
+                };
+
+                return (
+                    <div className="space-y-6 animate-in fade-in duration-500 bg-slate-50 p-4">
+                        {/* 1. Status Banner */}
+                        <div className={`p-4 rounded-xl shadow-sm border-l-8 flex items-center justify-between ${isPlanSuccess ? 'bg-green-50 border-green-500 text-green-800' : 'bg-red-50 border-red-500 text-red-800'}`}>
+                            <div className="flex items-center">
+                                <i data-lucide={isPlanSuccess ? "check-circle-2" : "alert-octagon"} className="w-8 h-8 mr-3"></i>
+                                <div>
+                                    <h2 className="text-xl font-bold">{isPlanSuccess ? "Successful Plan" : "Plan Needs Attention"}</h2>
+                                    <p className="text-sm opacity-90">{isPlanSuccess ? "All goals funded & solvent." : "You have unfunded goals or cashflow crises."}</p>
+                                </div>
+                            </div>
+                            <button onClick={handleExportPDF} disabled={isExporting} className="bg-white/80 hover:bg-white text-slate-800 px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm border border-slate-200">
+                                {isExporting ? <div className="loader"></div> : "Download Report"}
+                            </button>
+                        </div>
+
+                        {alerts.length > 0 && (
+                             <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-4 rounded shadow-sm">
+                                <h3 className="text-sm font-medium text-red-800">Critical Alerts</h3>
+                                <ul className="list-disc pl-5 mt-1 text-sm text-red-700 max-h-32 overflow-y-auto">
+                                    {alerts.map((a, i) => <li key={i}>{a.year}: {a.message}</li>)}
+                                </ul>
+                            </div>
+                        )}
+
+                        {/* 2. Key Metrics Cards */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-100">
+                                <div className="text-sm text-slate-500 mb-1">Current Net Worth</div>
+                                <div className="text-3xl font-bold text-slate-800">{formatCurrencyDisplay(currentNW)}</div>
+                                <div className="text-xs text-slate-400 mt-2">Age {profile.currentAge}</div>
+                            </div>
+                            <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-100">
+                                <div className="text-sm text-slate-500 mb-1">At Retirement</div>
+                                <div className={`text-3xl font-bold ${retireNW >= 0 ? 'text-blue-600' : 'text-red-600'}`}>{formatCurrencyDisplay(retireNW)}</div>
+                                <div className="text-xs text-slate-400 mt-2">Target Age {profile.retirementAge}</div>
+                            </div>
+                             <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-100">
+                                <div className="text-sm text-slate-500 mb-1">Legacy (At End of Life)</div>
+                                <div className={`text-3xl font-bold ${deathNW >= 0 ? 'text-purple-600' : 'text-red-600'}`}>{formatCurrencyDisplay(deathNW)}</div>
+                                <div className="text-xs text-slate-400 mt-2">Age {profile.lifeExpectancy}</div>
+                            </div>
+                        </div>
+
+                        {/* 3. Goal Status Section (Moved Up) */}
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                <h3 className="text-lg font-semibold mb-4 text-slate-700 flex items-center"><i data-lucide="flag" className="w-5 h-5 mr-2"></i>One-Time Milestones</h3>
+                                <div className="space-y-3">
+                                    {goalStatusLog.length === 0 && <p className="text-slate-400 italic text-sm">No one-time goals set.</p>}
+                                    {goalStatusLog.map((g, i) => (
+                                        <div key={i} className={`p-3 rounded-lg border flex flex-col ${['Achieved', 'Financed', 'Financed (Asset DP)', 'Financed (Income DP)', 'Financed (Hybrid DP)', 'Cashflow', 'Asset Funded', 'Hybrid (Inc+Ast)'].includes(g.status) ? 'bg-green-50 border-green-200' : g.status === 'Skipped' ? 'bg-slate-50 border-slate-200' : 'bg-red-50 border-red-200'}`}>
+                                            <div className="flex justify-between items-start">
+                                                <span className="font-semibold text-slate-700">{g.year} - {g.goal}</span>
+                                                <span className={`status-badge ${['Achieved', 'Financed', 'Financed (Asset DP)', 'Financed (Income DP)', 'Financed (Hybrid DP)', 'Cashflow', 'Asset Funded', 'Hybrid (Inc+Ast)'].includes(g.status) ? 'bg-green-200 text-green-800' : g.status === 'Skipped' ? 'bg-slate-200 text-slate-800' : 'bg-red-200 text-red-800'}`}>{g.status}</span>
+                                            </div>
+                                            {g.deficit > 0 && <span className="text-xs text-red-600 mt-1">Shortfall: {formatCurrencyDisplay(g.deficit)}</span>}
+                                            {g.reason && <span className="text-xs text-slate-500 mt-1">{g.reason}</span>}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                <h3 className="text-lg font-semibold mb-4 text-slate-700 flex items-center"><i data-lucide="calendar-clock" className="w-5 h-5 mr-2"></i>Tenured Expenses</h3>
+                                <div className="space-y-3">
+                                    {tenuredGoalStatusLog.length === 0 && <p className="text-slate-400 italic text-sm">No tenured expenses set.</p>}
+                                    {tenuredGoalStatusLog.map((g, i) => (
+                                        <div key={i} className={`p-3 rounded-lg border flex flex-col ${g.status === 'Funded' ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+                                            <div className="flex justify-between items-start">
+                                                <span className="font-semibold text-slate-700">{g.goal} <span className="text-xs font-normal text-slate-500 ml-1">({g.years})</span></span>
+                                                <span className={`status-badge ${g.status === 'Funded' ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'}`}>{g.status}</span>
+                                            </div>
+                                            {g.status === 'At Risk' && <span className="text-xs text-red-600 mt-1">Cashflow crisis detected during {g.crisisCount} year(s) of this goal.</span>}
+                                            {g.status === 'Funded' && <span className="text-xs text-green-600 mt-1">Fully funded through annual income/assets.</span>}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        {/* 4. Charts */}
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                <h3 className="text-lg font-semibold mb-4 text-slate-700">Detailed Net Worth Composition</h3>
+                                <ChartComponent id="nwChart" type="line" data={netWorthChartData} options={stackedOptions} />
+                            </div>
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                <h3 className="text-lg font-semibold mb-4 text-slate-700">Cash Flow (Amortized)</h3>
+                                <ChartComponent id="cfChart" type="line" data={cashFlowChartData} options={{ responsive: true, maintainAspectRatio: false }} />
+                            </div>
+                        </div>
+
+                        {/* 5. Detailed Table */}
+                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                            <h3 className="text-lg font-semibold mb-4 text-slate-700">Detailed Annual Projections</h3>
+                            <div className="proj-table-container border rounded-lg">
+                                <table className="min-w-full divide-y divide-slate-200 text-sm proj-table">
+                                    <thead className="bg-slate-50">
+                                        <tr>
+                                            <th className="px-3 py-3 text-left">Year</th>
+                                            <th className="px-3 py-3 text-right">Income</th>
+                                            <th className="px-3 py-3 text-right">Expense<br/><span className="text-xs font-normal">(Inc Interest)</span></th>
+                                            <th className="px-3 py-3 text-right">Principal Paid<br/><span className="text-xs font-normal">(Equity)</span></th>
+                                            <th className="px-3 py-3 text-right">Invested</th>
+                                            <th className="px-3 py-3 text-right">Total Assets</th>
+                                            <th className="px-3 py-3 text-right">Liabilities</th>
+                                            <th className="px-3 py-3 text-right">Net Worth</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-slate-200">
+                                        {timeline.map((t, idx) => (
+                                            <tr key={idx} className="hover:bg-slate-50">
+                                                <td className="px-3 py-2 text-slate-500">{t.year} <span className="text-xs text-slate-400">({t.age})</span></td>
+                                                <td className="px-3 py-2 text-right font-medium text-green-600">{formatCurrencyDisplay(t.income)}</td>
+                                                <td className="px-3 py-2 text-right text-red-600">{formatCurrencyDisplay(t.expense)}</td>
+                                                <td className="px-3 py-2 text-right text-orange-600">{formatCurrencyDisplay(t.principalPaid)}</td>
+                                                <td className="px-3 py-2 text-right text-blue-600">{formatCurrencyDisplay(t.invested)}</td>
+                                                <td className="px-3 py-2 text-right text-slate-700">{formatCurrencyDisplay(t.totalAssets)}</td>
+                                                <td className="px-3 py-2 text-right text-slate-400">{formatCurrencyDisplay(t.totalLiabilities)}</td>
+                                                <td className={`px-3 py-2 text-right font-bold ${t.netWorth >= 0 ? 'text-slate-800' : 'text-red-600'}`}>{formatCurrencyDisplay(t.netWorth)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            return (
+                <div className="min-h-screen pb-20">
+                    <header className="bg-white shadow-sm sticky top-0 z-10">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between h-16">
+                                <div className="flex items-center"><i data-lucide="trending-up" className="w-8 h-8 text-blue-600 mr-3"></i><h1 className="text-xl font-bold text-slate-800">Sovereign <span className="text-slate-400 font-normal text-sm ml-2">Personal Wealth Planner</span></h1></div>
+                            </div>
+                            <div className="flex overflow-x-auto no-scrollbar">
+                                {['dashboard','profile','incomes','expenses','assets','liabilities','goals'].map(id => (
+                                    <TabBtn key={id} id={id} label={id.charAt(0).toUpperCase() + id.slice(1)} icon={id==='dashboard'?'layout-dashboard': id==='profile'?'user': id==='incomes'?'arrow-down-circle': id==='expenses'?'arrow-up-circle': id==='assets'?'briefcase': id==='liabilities'?'credit-card': id==='goals'?'target':'pie-chart'} activeTab={activeTab} setActiveTab={setActiveTab} />
+                                ))}
+                            </div>
+                        </div>
+                    </header>
+                    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                        {activeTab === 'dashboard' && <Dashboard simulationResults={simulationResults} />}
+                        {activeTab === 'profile' && (
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 max-w-3xl">
+                                <h3 className="text-lg font-semibold mb-4 text-slate-700">Financial Profile</h3>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <div className="col-span-2 grid grid-cols-3 gap-4">
+                                        <div><label className="text-sm font-medium">Name</label><input type="text" value={profile.name} onChange={e=>setProfile({...profile, name: e.target.value})} className="w-full border p-2 rounded"/></div>
+                                        <div><label className="text-sm font-medium">Current Age</label><input type="number" value={profile.currentAge} onChange={e=>setProfile({...profile, currentAge: +e.target.value})} className="w-full border p-2 rounded"/></div>
+                                        <div><label className="text-sm font-medium">Retirement Age</label><input type="number" value={profile.retirementAge} onChange={e=>setProfile({...profile, retirementAge: +e.target.value})} className="w-full border p-2 rounded"/></div>
+                                    </div>
+                                    <div className="pt-4 border-t col-span-2">
+                                        <h4 className="font-medium mb-3">Planning Assumptions</h4>
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div><label className="text-sm text-slate-600">Life Expectancy</label><input type="number" value={profile.lifeExpectancy} onChange={e=>setProfile({...profile, lifeExpectancy: +e.target.value})} className="w-full border p-2 rounded"/></div>
+                                            <div><label className="text-sm text-slate-600">Base Inflation %</label><input type="number" value={profile.inflation} onChange={e=>setProfile({...profile, inflation: +e.target.value})} className="w-full border p-2 rounded"/></div>
+                                        </div>
+                                    </div>
+                                    <div className="pt-4 border-t col-span-2">
+                                        <h4 className="font-medium mb-3">Emergency Fund & SIP Strategy</h4>
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="text-sm text-slate-600 block mb-1">Emergency Fund (Months of Exp)</label>
+                                                <input type="number" value={profile.emergencyFundMonths} onChange={e=>setProfile({...profile, emergencyFundMonths: +e.target.value})} className="w-full border p-2 rounded"/>
+                                                <p className="text-xs text-slate-400 mt-1">Target: {profile.emergencyFundMonths}x monthly expenses. Fills before SIPs.</p>
+                                            </div>
+                                            <div>
+                                                <label className="text-sm text-slate-600 block mb-1">SIP Growth Strategy</label>
+                                                <select value={profile.sipStrategy} onChange={e=>setProfile({...profile, sipStrategy: e.target.value})} className="w-full border p-2 rounded bg-white">
+                                                    <option value="Growth">Fixed % Growth (Yearly Increase)</option>
+                                                    <option value="Proportional">% of Surplus (Dynamic)</option>
+                                                </select>
+                                                <p className="text-xs text-slate-400 mt-1">{profile.sipStrategy === 'Growth' ? 'Invest fixed amounts + annual step-up.' : 'Distribute all extra cash based on % weights.'}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                        {activeTab === 'incomes' && <DataTable data={incomes} setData={setIncomes} initialItem={{name: 'New Income', monthlyAmount: 0, growthRate: 5, startYear: 0, endYear: 20}} columns={[{key:'name',label:'Source'},{key:'monthlyAmount',label:'Monthly Amt',type:'number',format:'money'},{key:'growthRate',label:'Growth %',type:'number',format:'percent'},{key:'startYear',label:'Start Year',type:'number'},{key:'endYear',label:'End Year',type:'number',max: planningHorizon}]} />}
+                        {activeTab === 'expenses' && <DataTable data={expenses} setData={setExpenses} initialItem={{name: 'New Expense', amount: 0, frequency: 'Monthly', inflation: 6, startYear: 0, endYear: 40}} columns={[{key:'name',label:'Category'},{key:'amount',label:'Amount',type:'number',format:'money'},{key:'frequency',label:'Frequency',type:'select',options:['Monthly','Annual']},{key:'inflation',label:'Inflation % (Override)',type:'number',format:'percent'},{key:'endYear',label:'Duration',type:'number',max: planningHorizon}]} />}
+                        {activeTab === 'assets' && (
+                            <div className="space-y-4">
+                                {profile.sipStrategy === 'Proportional' && Math.abs(assets.reduce((sum, a) => sum + (a.sipProportion || 0), 0) - 100) > 0.1 && (
+                                    <div className="bg-red-50 border-l-4 border-red-500 p-4 text-red-700">
+                                        <p className="font-bold">Allocation Error</p>
+                                        <p className="text-sm">Total SIP Proportion split must equal exactly 100%. Current Total: {assets.reduce((sum, a) => sum + (a.sipProportion || 0), 0).toFixed(1)}%</p>
+                                    </div>
+                                )}
+                                <div className="bg-blue-50 p-4 rounded-md text-blue-800 text-sm flex gap-2">
+                                    <i data-lucide="info" className="w-5 h-5 flex-shrink-0"></i>
+                                    <div>
+                                        <strong>Asset Logic:</strong> 
+                                        <ul className="list-disc pl-4 mt-1">
+                                            <li><strong>Emergency Fund:</strong> Fills first. Not liquidated for goals.</li>
+                                            <li><strong>SIP Strategy ({profile.sipStrategy}):</strong> 
+                                            {profile.sipStrategy === 'Growth' ? ' Enter "SIP Amt" and "SIP Growth %".' : ' Enter "SIP % of Surplus".'}
+                                            </li>
+                                        </ul>
+                                    </div>
+                                </div>
+                                <DataTable 
+                                    data={assets} setData={setAssets} 
+                                    initialItem={{name: 'New Asset', type: 'Growth', currentValue: 0, returnRate: 8, investmentPriority: 5, liquidationPriority: 5, sipAmount: 0, sipGrowth: 0, sipProportion: 0, sipStartYear: 0, sipEndYear: 20}} 
+                                    columns={[
+                                        {key:'name',label:'Asset Name'},
+                                        {key:'type',label:'Type',type:'select',options:['Emergency Fund','Liquid','Growth','Locked','Commodity']},
+                                        {key:'currentValue',label:'Current Val',type:'number',format:'money'},
+                                        {key:'returnRate',label:'Return %',type:'number',format:'percent'},
+                                        {key:'liquidationPriority',label:'Liq. Prio',type:'number'},
+                                        ...(profile.sipStrategy === 'Growth' ? [
+                                            {key:'sipAmount',label:'SIP Amt',type:'number',format:'money'},
+                                            {key:'sipGrowth',label:'SIP StepUp %',type:'number',format:'percent'},
+                                        ] : [
+                                            {key:'sipProportion',label:'Surplus %',type:'number',format:'percent'},
+                                        ]),
+                                        {key:'sipStartYear',label:'SIP Start Yr',type:'number'},
+                                        {key:'sipEndYear',label:'SIP End Yr',type:'number',max: planningHorizon}
+                                    ]} 
+                                />
+                            </div>
+                        )}
+                        {activeTab === 'liabilities' && <DataTable data={liabilities} setData={setLiabilities} initialItem={{name: 'New Loan', outstanding: 0, interestRate: 9, emi: 0, endDateOffset: 10}} columns={[{key:'name',label:'Loan Name'},{key:'outstanding',label:'Principal',type:'number',format:'money'},{key:'interestRate',label:'Int %',type:'number',format:'percent'},{key:'endDateOffset',label:'Tenure',type:'number'},{key:'emi',label:'EMI',type:'number',format:'money'}]} />}
+                        {activeTab === 'goals' && (
+                            <div className="space-y-8">
+                                <div>
+                                    <h3 className="text-lg font-bold text-slate-700 mb-2 flex items-center"><i data-lucide="flag" className="mr-2 w-5 h-5"></i>One-Time Milestones</h3>
+                                    <p className="text-sm text-slate-500 mb-4">
+                                        Use "Funding Type" to control how goals are paid for. 
+                                        <strong> Savings-Only:</strong> Uses only Liquid assets. 
+                                        <strong> Income-Only:</strong> Paid from annual surplus (no asset sale).
+                                        <strong> Real Estate:</strong> Goals with "Home/Property" in name trigger asset tracking.
+                                    </p>
+                                    <DataTable data={oneTimeGoals} setData={setOneTimeGoals} 
+                                        initialItem={{name: 'New Goal', cost: 0, type: 'Desire', yearOffset: 5, inflation: 6, fundingType: 'Asset', downPaymentPercent: 20, loanInterest: 9, loanTenure: 10}} 
+                                        columns={[
+                                            { key: 'name', label: 'Goal Name' }, 
+                                            { key: 'cost', label: 'Cost Today', type: 'number',format:'money' }, 
+                                            { key: 'type', label: 'Priority', type: 'select', options: ['Need', 'Desire'] }, 
+                                            { key: 'yearOffset', label: 'Years Away', type: 'number' }, 
+                                            { key: 'inflation', label: 'Inflation %', type: 'number',format:'percent' }, 
+                                            { key: 'fundingType', label: 'Funding', type: 'select', options: ['Asset', 'Loan', 'Savings-Only', 'Income-Only'] }, 
+                                            { key: 'downPaymentPercent', label: 'DP %', type: 'number',format:'percent' }, 
+                                            { key: 'loanInterest', label: 'Loan Int %', type: 'number',format:'percent' }, 
+                                            { key: 'loanTenure', label: 'Loan Yrs', type: 'number', max: (item) => Math.max(0, planningHorizon - (item.yearOffset || 0)) }
+                                        ]} 
+                                    />
+                                </div>
+                                <div>
+                                    <h3 className="text-lg font-bold text-slate-700 mb-2 flex items-center"><i data-lucide="calendar-clock" className="mr-2 w-5 h-5"></i>Tenured Expenses</h3>
+                                    <DataTable data={tenuredGoals} setData={setTenuredGoals} initialItem={{name: 'New Expense', annualCost: 0, startYearOffset: 10, duration: 4, inflation: 8}} columns={[{ key: 'name', label: 'Expense Name' }, { key: 'annualCost', label: 'Annual Cost (Today)', type: 'number',format:'money' }, { key: 'startYearOffset', label: 'Starts In (Yrs)', type: 'number', max: planningHorizon }, { key: 'duration', label: 'Duration (Yrs)', type: 'number', max: planningHorizon }, { key: 'inflation', label: 'Inflation %', type: 'number',format:'percent' }]} />
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+        setTimeout(() => lucide.createIcons(), 100);
+        setInterval(() => lucide.createIcons(), 2000); 
+    </script>
+</body>
+</html>
